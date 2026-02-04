@@ -228,7 +228,7 @@ where
 impl<TxnId, FE> File<TxnId, FE>
 where
     TxnId: Name + Hash + Ord + PartialOrd<str> + fmt::Debug + Copy + Send + Sync,
-    FE: for<'a> FileSave<'a> + Send + Sync,
+    FE: FileSave + Send + Sync,
 {
     /// Commit the state of this file at `txn_id`.
     /// This will un-block any pending future write locks.

@@ -121,7 +121,7 @@ impl<TxnId: Copy + Hash + Eq + Ord + fmt::Debug, FE> Dir<TxnId, FE> {
 impl<TxnId, FE> Dir<TxnId, FE>
 where
     TxnId: Name + Hash + Ord + Copy + fmt::Display + fmt::Debug + Send + Sync + 'static,
-    FE: for<'a> FileSave<'a> + Clone,
+    FE: FileSave + Clone,
 {
     /// Load a transactional [`Dir`] from a [`DirLock`].
     pub fn load(
@@ -441,7 +441,7 @@ where
     ) -> Result<FileVersionWrite<TxnId, FE, F>>
     where
         F: FileLoad + GetSize + Clone,
-        FE: for<'a> FileSave<'a> + AsType<F>,
+        FE: FileSave + AsType<F>,
     {
         if let Some(file) = self.get_file(txn_id, name).await? {
             file.write(txn_id).await
@@ -454,7 +454,7 @@ where
 impl<TxnId, FE> Dir<TxnId, FE>
 where
     TxnId: Name + PartialOrd<str> + Hash + Copy + Ord + fmt::Debug + Send + Sync,
-    FE: for<'a> FileSave<'a> + Clone,
+    FE: FileSave + Clone,
 {
     /// Commit the state of this [`Dir`] at `txn_id`.
     pub fn commit<'a>(
