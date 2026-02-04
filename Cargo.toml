@@ -1,11 +1,11 @@
 [package]
 name = "txfs"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["code@tinychain.net"]
 edition = "2021"
 license = "Apache-2.0"
 description = "A cached transactional filesystem layer over tokio::fs"
-repository = "https://github.com/haydnv/txfs"
+repository = "https://github.com/TinyChain-Inc/txfs"
 readme = "README.md"
 
 categories = ["caching", "data-structures", "filesystem", "memory-management"]
@@ -21,15 +21,15 @@ logging = ["log", "freqfs/logging", "txn_lock/logging"]
 stream = ["freqfs/stream"]
 
 [dependencies]
-freqfs = { version = "0.10", features = ["id"] }
+freqfs = { version = "0.12", features = ["id"] }
 futures = "0.3"
 get-size = "0.1"
-hr-id = "0.6"
+hr-id = "0.7"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
 safecast = "0.2"
 txn_lock = { version = "0.10", features = ["all"] }
 
 [dev-dependencies]
-destream = "0.8"
-rand = "0.8"
-tokio = { version = "1.39", features = ["macros"] }
+destream = "0.10"
+rand = "0.9"
+tokio = { version = "1.49", features = ["macros"] }
