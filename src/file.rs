@@ -141,7 +141,7 @@ where
             log::trace!("truncate obsolete versions of {name}...");
             versions.truncate().await;
 
-            versions.copy_file_from(txn_id.to_string(), &canon).await?;
+            versions.copy_file_from(txn_id.to_string(), canon).await?;
 
             #[cfg(feature = "logging")]
             log::trace!("copied canonical version of {:?}", canon);
@@ -240,7 +240,7 @@ where
     {
         let last_modified = self.last_modified.read_and_commit(txn_id).await;
 
-        if &*last_modified == &txn_id {
+        if *last_modified == txn_id {
             let versions = self.versions.read().await;
             if let DirEntry::File(file) = versions.get(&txn_id).expect("version") {
                 let mut parent = self.parent.write().await;
@@ -263,7 +263,7 @@ where
     pub async fn rollback(&self, txn_id: TxnId) {
         let last_modified = self.last_modified.read_and_rollback(txn_id).await;
 
-        if &*last_modified == &txn_id {
+        if *last_modified == txn_id {
             let mut versions = self.versions.write().await;
             versions.delete(&txn_id).await;
         }

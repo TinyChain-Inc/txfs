@@ -171,9 +171,7 @@ mod tests {
     #[tokio::test]
     async fn file_roundtrip_persists_bytes() -> Result<(), Box<dyn std::error::Error>> {
         let mut path = std::env::temp_dir();
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_nanos();
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         path.push(format!("txfs_test_{}_{}", std::process::id(), unique));
         fs::create_dir(&path).await?;
 
