@@ -40,18 +40,12 @@ impl<TxnId, FE> Clone for DirEntry<TxnId, FE> {
 impl<TxnId, FE> DirEntry<TxnId, FE> {
     /// Return `true` if this [`DirEntry`] is itself a [`Dir`].
     pub fn is_dir(&self) -> bool {
-        match self {
-            Self::Dir(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Dir(_))
     }
 
     /// Return `true` if this [`DirEntry`] is a [`File`].
     fn is_file(&self) -> bool {
-        match self {
-            Self::File(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::File(_))
     }
 }
 
@@ -475,7 +469,7 @@ where
                     #[cfg(feature = "logging")]
                     log::trace!("Dir::commit {}: {:?}", _name, entry);
 
-                    let entry = DirEntry::clone(&*entry);
+                    let entry = DirEntry::clone(entry);
 
                     commits.push(async move {
                         match entry {
@@ -525,7 +519,7 @@ where
                 let rollbacks = FuturesUnordered::new();
 
                 for (_name, entry) in contents {
-                    let entry = DirEntry::clone(&*entry);
+                    let entry = DirEntry::clone(&entry);
 
                     rollbacks.push(async move {
                         match entry {
@@ -546,8 +540,8 @@ where
 
         if let Some(entries) = self.entries.read_and_finalize(txn_id) {
             let names = entries
-                .into_iter()
-                .map(|(name, _)| name.to_string())
+                .into_keys()
+                .map(|name| name.to_string())
                 .collect::<HashSet<_>>();
 
             let delete_versions = {
