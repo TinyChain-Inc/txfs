@@ -85,6 +85,14 @@ where
         debug_assert!(self.canon.try_read().expect("canon").contains(VERSIONS));
         self.canon
     }
+
+    /// Clone the committed canonical directory without opening a transaction.
+    ///
+    /// Use this for committed snapshot reads. Transactional reads and writes should still
+    /// use the `Dir` methods which accept an explicit transaction ID.
+    pub fn canonical(&self) -> DirLock<FE> {
+        self.canon.clone()
+    }
 }
 
 impl<TxnId: Copy + Hash + Eq + Ord + fmt::Debug, FE> Dir<TxnId, FE> {
