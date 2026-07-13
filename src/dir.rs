@@ -498,8 +498,10 @@ where
                     if entry.is_none() {
                         assert!(!contents.contains_key(&*name));
 
-                        if let Some(entry) = canon.get(&*name) {
-                            needs_sync = needs_sync || entry.is_file();
+                        if canon.get(&*name).is_some() {
+                            // freqfs tracks deletions until sync; synchronize after deleting
+                            // any canonical entry so same-name recreation is possible.
+                            needs_sync = true;
                         }
 
                         canon.delete(&*name).await;
