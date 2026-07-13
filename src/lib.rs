@@ -73,15 +73,15 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-    struct TxnId(u64);
+    struct Txn(u64);
 
-    impl fmt::Display for TxnId {
+    impl fmt::Display for Txn {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             self.0.fmt(f)
         }
     }
 
-    impl PartialEq<str> for TxnId {
+    impl PartialEq<str> for Txn {
         fn eq(&self, other: &str) -> bool {
             if let Ok(other) = other.parse() {
                 self.0 == other
@@ -91,7 +91,7 @@ mod tests {
         }
     }
 
-    impl PartialOrd<str> for TxnId {
+    impl PartialOrd<str> for Txn {
         fn partial_cmp(&self, other: &str) -> Option<Ordering> {
             if let Ok(other) = other.parse() {
                 PartialOrd::partial_cmp(&self.0, &other)
@@ -101,7 +101,7 @@ mod tests {
         }
     }
 
-    impl Name for TxnId {
+    impl Name for Txn {
         fn partial_cmp(&self, key: &str) -> Option<Ordering> {
             Name::partial_cmp(&self.0, key)
         }
@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn name_partial_cmp_accepts_str() {
-        let id = TxnId(5);
+        let id = Txn(5);
 
         assert_eq!(Name::partial_cmp(&id, "5"), Some(Ordering::Equal));
         assert_eq!(Name::partial_cmp(&id, "7"), Some(Ordering::Less));
@@ -177,26 +177,26 @@ mod tests {
 
         let cache = Cache::<Entry>::new(40, None);
         let root = cache.load(path.clone())?;
-        let dir = super::Dir::load(TxnId(1), root).await?;
+        let dir = super::Dir::load(Txn(1), root).await?;
 
         let name: super::Id = "file-one".parse()?;
         let file = dir
-            .create_file(TxnId(1), name, Entry::Bin(vec![1u8, 2, 3]))
+            .create_file(Txn(1), name, Entry::Bin(vec![1u8, 2, 3]))
             .await?;
 
-        let read = file.read::<Entry>(TxnId(1)).await?;
+        let read = file.read::<Entry>(Txn(1)).await?;
         match &*read {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[1u8, 2, 3]),
         }
 
         {
-            let mut write = file.write::<Entry>(TxnId(2)).await?;
+            let mut write = file.write::<Entry>(Txn(2)).await?;
             *write = Entry::Bin(vec![9u8, 8]);
         }
 
-        file.commit(TxnId(2)).await;
+        file.commit(Txn(2)).await;
 
-        let read = file.read::<Entry>(TxnId(3)).await?;
+        let read = file.read::<Entry>(Txn(3)).await?;
         match &*read {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[9u8, 8]),
         }

@@ -12,9 +12,9 @@ use tokio::fs;
 use txfs::Dir;
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
-struct TxnId(u64);
+struct Txn(u64);
 
-impl PartialEq<str> for TxnId {
+impl PartialEq<str> for Txn {
     fn eq(&self, other: &str) -> bool {
         if let Ok(other) = other.parse() {
             self.0 == other
@@ -24,7 +24,7 @@ impl PartialEq<str> for TxnId {
     }
 }
 
-impl PartialOrd<str> for TxnId {
+impl PartialOrd<str> for Txn {
     fn partial_cmp(&self, other: &str) -> Option<Ordering> {
         if let Ok(other) = other.parse() {
             self.0.partial_cmp(&other)
@@ -34,13 +34,13 @@ impl PartialOrd<str> for TxnId {
     }
 }
 
-impl freqfs::Name for TxnId {
+impl freqfs::Name for Txn {
     fn partial_cmp(&self, key: &str) -> Option<Ordering> {
         freqfs::Name::partial_cmp(&self.0, key)
     }
 }
 
-impl fmt::Display for TxnId {
+impl fmt::Display for Txn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
@@ -77,9 +77,9 @@ async fn setup_tmp_dir() -> Result<PathBuf, io::Error> {
 }
 
 async fn run_example(cache: DirLock<File>) -> Result<(), txfs::Error> {
-    let first_txn = TxnId(1);
-    let second_txn = TxnId(2);
-    let third_txn = TxnId(3);
+    let first_txn = Txn(1);
+    let second_txn = Txn(2);
+    let third_txn = Txn(3);
 
     let root = Dir::load(first_txn, cache).await?;
 
@@ -130,7 +130,7 @@ async fn run_example(cache: DirLock<File>) -> Result<(), txfs::Error> {
     // call "finalize" to drop all information about commits earlier than the given transaction ID
     root.finalize(third_txn).await;
 
-    let fourth_txn = TxnId(4);
+    let fourth_txn = Txn(4);
 
     // anything that was deleted is now safe to re-create
     let subdir = root.create_dir(fourth_txn, subdir_name).await?;
@@ -141,7 +141,7 @@ async fn run_example(cache: DirLock<File>) -> Result<(), txfs::Error> {
 
     root.commit(fourth_txn, true).await;
 
-    let fifth_txn = TxnId(5);
+    let fifth_txn = Txn(5);
 
     // and access in later transactions
     assert_eq!(&*file.read::<Vec<u8>>(fifth_txn).await?, &[3u8, 4, 5]);
