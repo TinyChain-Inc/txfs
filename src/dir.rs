@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::{fmt, io};
 
 use freqfs::{DirLock, FileLoad, FileSave};
-use futures::future::{Future, TryFutureExt, try_join_all};
+use futures::future::{try_join_all, Future, TryFutureExt};
 use futures::stream::{self, FuturesUnordered, Stream, StreamExt};
 use get_size::GetSize;
 use hr_id::Id;
@@ -85,14 +85,6 @@ where
     pub fn into_inner(self) -> DirLock<FE> {
         debug_assert!(self.canon.try_read().expect("canon").contains(VERSIONS));
         self.canon
-    }
-
-    /// Clone the committed canonical directory without opening a transaction.
-    ///
-    /// Use this for committed snapshot reads. Transactional reads and writes should still
-    /// use the `Dir` methods which accept an explicit transaction ID.
-    pub fn canonical(&self) -> DirLock<FE> {
-        self.canon.clone()
     }
 }
 
@@ -470,7 +462,8 @@ where
                 }
             }
 
-            let mut needs_sync = false;
+            // New directory entries need durable publication as well as deletions.
+            let mut needs_sync = deltas.as_ref().is_some_and(|deltas| !deltas.is_empty());
             if let Some(deltas) = deltas {
                 let mut canon = self.canon.write().await;
 
@@ -491,7 +484,7 @@ where
 
             if needs_sync {
                 // remove the canonical version of any file that was deleted in this transaction
-                self.canon.sync().await?;
+                self.canon.sync_all().await?;
             }
             Ok(())
         })
@@ -602,7 +595,7 @@ where
         }
 
         if sync_canon {
-            self.canon.sync().await?;
+            self.canon.sync_all().await?;
         }
         Ok(())
     }

@@ -1,26 +1,28 @@
 # Contributing to txfs
 
-`txfs` provides a transactional filesystem layer used by TinyChain. Keep changes
-minimal, general, and aligned with the shared txfs layout contract so every
-adapter can hydrate the same on-disk tree.
+`txfs` is a standalone transactional filesystem library. Keep changes minimal,
+general-purpose, and defined by this repository's public API and tests. TinyChain
+is one consumer and does not define this crate's local contract.
 
 ## Before you start
 
-- Read `README.md` and `AGENTS.md` for scope and design constraints.
-- Follow the repo-wide code style in `CODE_STYLE.md` (import grouping and
-  rustfmt/clippy expectations).
+- Read `README.md` for the supported API and storage model.
+- Use `cargo fmt` and Clippy's repository-local configuration.
 
 ## Development checklist
 
-1. **Preserve URI ↔ txfs mirroring.** Any path/layout changes must keep the
-   `<data-dir>/<segment>` layout aligned with canonical URI helpers.
-2. **Serialization symmetry.** If you change `destream` encoders/decoders,
+1. **Preserve storage semantics.** Path and layout changes require focused
+   create, load, transaction, and restart coverage.
+2. **Require transactional reads.** Canonical files may initialize an
+   unpublished `Dir`, but every observation after construction must carry a
+   transaction ID and retain the corresponding read guard.
+3. **Serialization symmetry.** If you change `destream` encoders/decoders,
    add round-trip coverage to keep `IntoStream`/`FromStream` pairs stable.
-3. **Avoid bespoke storage.** Keep new behavior expressed in terms of existing
+4. **Avoid bespoke storage.** Keep new behavior expressed in terms of existing
    primitives and traits; prefer general-purpose traits over special cases.
-4. **Testing.** Run `cargo test --all-features`. Add focused unit tests for any
+5. **Testing.** Run `cargo test --all-features`. Add focused unit tests for any
    new transactional or locking behavior.
-5. **Docs.** Update `README.md` (and other relevant docs) when user-visible
+6. **Docs.** Update `README.md` (and other relevant docs) when user-visible
    behavior changes.
 
 ## Pre-submit
