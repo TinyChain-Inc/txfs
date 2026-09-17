@@ -81,15 +81,13 @@ where
         FE: AsType<F>,
         F: GetSize,
     {
-        debug_assert!(
-            versions
-                .try_read()
-                .expect("version dir")
-                .path()
-                .to_str()
-                .expect("path")
-                .ends_with(name.as_str())
-        );
+        debug_assert!(versions
+            .try_read()
+            .expect("version dir")
+            .path()
+            .to_str()
+            .expect("path")
+            .ends_with(name.as_str()));
 
         {
             let size = version.get_size();
@@ -111,15 +109,13 @@ where
         #[cfg(feature = "logging")]
         log::debug!("load file {} into the transactional filesystem cache", name);
 
-        debug_assert!(
-            versions
-                .try_read()
-                .expect("version dir")
-                .path()
-                .to_str()
-                .expect("path")
-                .ends_with(name.as_str())
-        );
+        debug_assert!(versions
+            .try_read()
+            .expect("version dir")
+            .path()
+            .to_str()
+            .expect("path")
+            .ends_with(name.as_str()));
 
         {
             let parent = parent.try_read().map_err(Error::from)?;
@@ -285,7 +281,7 @@ where
             let canon = parent
                 .copy_file_from(self.name.to_string(), &staged)
                 .await?;
-            canon.sync().await?;
+            canon.sync_all().await?;
         }
         drop(last_modified);
         self.last_modified.read_and_commit(txn_id).await;

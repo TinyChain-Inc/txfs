@@ -70,8 +70,8 @@ mod tests {
     use freqfs::Cache;
     use freqfs::Name;
     use get_size::GetSize;
-    use safecast::AsType;
     use safecast::as_type;
+    use safecast::AsType;
     use tokio::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -218,8 +218,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_reads_committed_state_without_a_transaction()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn load_initializes_state_for_transactional_reads(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut path = std::env::temp_dir();
         let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         path.push(format!("txfs_load_test_{}_{}", std::process::id(), unique));
@@ -230,10 +230,41 @@ mod tests {
         let root = cache.load(path.clone())?;
         let dir = super::Dir::<Txn, Entry>::load(root).await?;
         let name: super::Id = "file-one".parse()?;
-        let file = dir.get_file(Txn(7), &name).await?.expect("committed file");
-        let read = file.read::<Entry>(Txn(7)).await?;
-        match &*read {
+        let entries = dir
+            .iter(Txn(7))
+            .await?
+            .map(|(name, _)| (*name).clone())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [name.clone()]);
+        let file = dir
+            .get_file(Txn(7), &name)
+            .await?
+            .expect("committed file")
+            .clone();
+        match &*file.read::<Entry>(Txn(7)).await? {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[4u8, 5, 6]),
+        }
+
+        {
+            let mut pending = file.write::<Entry>(Txn(8)).await?;
+            *pending = Entry::Bin(vec![8]);
+        }
+        match &*file.read::<Entry>(Txn(7)).await? {
+            Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[4u8, 5, 6]),
+        }
+        file.rollback(Txn(8)).await?;
+
+        {
+            let mut committed = file.write::<Entry>(Txn(9)).await?;
+            *committed = Entry::Bin(vec![9]);
+        }
+        file.commit(Txn(9)).await?;
+        match &*file.read::<Entry>(Txn(10)).await? {
+            Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[9]),
+        }
+        file.finalize(Txn(9)).await?;
+        match &*file.read::<Entry>(Txn(10)).await? {
+            Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[9]),
         }
 
         fs::remove_dir_all(path).await?;
@@ -241,8 +272,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_rejects_pending_state_without_deleting_it()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn load_rejects_pending_state_without_deleting_it(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut path = std::env::temp_dir();
         let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         path.push(format!(
