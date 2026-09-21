@@ -13,12 +13,10 @@ keywords = ["transactional", "versioning", "file", "io", "cache"]
 
 [[example]]
 name = "example"
-required-features = ["stream"]
 
 [features]
-all = ["logging", "stream"]
+all = ["logging"]
 logging = ["log", "freqfs/logging", "txn_lock/logging"]
-stream = ["freqfs/stream"]
 
 [dependencies]
 freqfs = { path = "../freqfs", version = "0.13", features = ["id"] }
@@ -30,6 +28,7 @@ safecast = "0.2"
 txn_lock = { path = "../txn_lock", version = "0.11", features = ["all"] }
 
 [dev-dependencies]
+tbon = { path = "../tbon", version = "0.9", features = ["tokio-io"] }
 destream = { path = "../destream", version = "0.10" }
 rand = "0.9"
 tokio = { version = "1.49", features = ["macros"] }

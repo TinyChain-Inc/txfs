@@ -235,7 +235,7 @@ mod tests {
             .await?
             .map(|(name, _)| (*name).clone())
             .collect::<Vec<_>>();
-        assert_eq!(entries, [name.clone()]);
+        assert_eq!(entries.as_slice(), std::slice::from_ref(&name));
         let file = dir
             .get_file(Txn(7), &name)
             .await?

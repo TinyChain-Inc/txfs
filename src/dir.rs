@@ -250,8 +250,8 @@ where
         txn_id: TxnId,
     ) -> Result<impl Stream<Item = Result<(Key, FileVersionRead<TxnId, FE, F>)>> + Send + Unpin + '_>
     where
-        FE: AsType<F>,
-        F: FileLoad,
+        FE: FileLoad + AsType<F>,
+        F: Send + Sync + 'static,
     {
         let entries = self.entries.iter(txn_id).await?;
         let files = entries.filter_map(|(name, entry)| match &*entry {
@@ -330,7 +330,7 @@ where
         contents: F,
     ) -> Result<File<TxnId, FE>>
     where
-        FE: AsType<F>,
+        FE: FileLoad + AsType<F>,
         F: GetSize + Clone,
     {
         #[cfg(feature = "logging")]
@@ -394,8 +394,8 @@ where
         name: &Id,
     ) -> Result<FileVersionRead<TxnId, FE, F>>
     where
-        F: FileLoad,
-        FE: AsType<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F>,
     {
         if let Some(file) = self.get_file(txn_id, name).await? {
             file.read(txn_id).await
@@ -412,8 +412,8 @@ where
         name: &Id,
     ) -> Result<FileVersionWrite<TxnId, FE, F>>
     where
-        F: FileLoad + GetSize + Clone,
-        FE: FileSave + AsType<F>,
+        F: Send + Sync + 'static + GetSize + Clone,
+        FE: FileLoad + FileSave + AsType<F>,
     {
         if let Some(file) = self.get_file(txn_id, name).await? {
             file.write(txn_id).await
