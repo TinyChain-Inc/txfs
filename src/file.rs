@@ -78,7 +78,7 @@ where
         version: F,
     ) -> Result<Self>
     where
-        FE: AsType<F>,
+        FE: FileLoad + AsType<F>,
         F: GetSize,
     {
         debug_assert!(versions
@@ -154,8 +154,8 @@ where
     /// Lock this file for reading at the given `txn_id`.
     pub async fn read<F>(&self, txn_id: TxnId) -> Result<FileVersionRead<TxnId, FE, F>>
     where
-        F: FileLoad,
-        FE: AsType<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F>,
     {
         let last_modified = self.last_modified.read(txn_id).await?;
         let staged = {
@@ -185,8 +185,8 @@ where
     /// Lock this file for reading at the given `txn_id` without borrowing.
     pub async fn into_read<F>(self, txn_id: TxnId) -> Result<FileVersionRead<TxnId, FE, F>>
     where
-        F: FileLoad,
-        FE: AsType<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F>,
     {
         self.read(txn_id).await
     }
@@ -194,8 +194,8 @@ where
     /// Lock this file for writing at the given `txn_id`.
     pub async fn write<F>(&self, txn_id: TxnId) -> Result<FileVersionWrite<TxnId, FE, F>>
     where
-        F: FileLoad + Clone + GetSize,
-        FE: AsType<F>,
+        F: Send + Sync + 'static + Clone + GetSize,
+        FE: FileLoad + AsType<F>,
     {
         let mut last_modified = self.last_modified.write(txn_id).await?;
         let version = if last_modified
@@ -245,8 +245,8 @@ where
     /// Lock this file for writing at the given `txn_id` without borrowing.
     pub async fn into_write<F>(self, txn_id: TxnId) -> Result<FileVersionWrite<TxnId, FE, F>>
     where
-        F: FileLoad + Clone + GetSize,
-        FE: AsType<F>,
+        F: Send + Sync + 'static + Clone + GetSize,
+        FE: FileLoad + AsType<F>,
     {
         self.write(txn_id).await
     }
