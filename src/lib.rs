@@ -3,7 +3,7 @@
 
 use std::{fmt, io};
 
-pub use dir::{Dir, DirEntry, Key, VERSIONS};
+pub use dir::{Dir, DirEntry, Key, NATIVE, VERSIONS};
 pub use file::{File, FileVersionRead, FileVersionWrite};
 pub use hr_id::Id;
 

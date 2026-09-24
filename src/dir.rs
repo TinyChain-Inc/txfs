@@ -23,6 +23,11 @@ pub type Key = txn_lock::map::Key<Id>;
 /// The name of the directory where un-committed file versions are cached
 pub const VERSIONS: &str = ".txfs";
 
+/// Storage delegated to an owner which supplies its own persistence lifecycle.
+/// Membership follows the enclosing transactional directory. Its contents are
+/// never interpreted, versioned, or synchronized recursively by txfs.
+pub const NATIVE: &str = ".native";
+
 /// An entry in a [`Dir`]
 pub enum DirEntry<TxnId, FE> {
     Dir(Dir<TxnId, FE>),
@@ -80,6 +85,22 @@ impl<TxnId, FE> Dir<TxnId, FE>
 where
     FE: Send + Sync,
 {
+    /// Load a previously delegated native subtree without creating missing storage.
+    pub async fn native(&self) -> Result<Option<DirLock<FE>>> {
+        let canon = self.canon.read().await;
+        match canon.get(NATIVE) {
+            Some(freqfs::DirEntry::Dir(dir)) => Ok(Some(dir.clone())),
+            Some(_) => Err(Error::Corrupt("native storage is not a directory".into())),
+            None => Ok(None),
+        }
+    }
+
+    /// Allocate native storage for an unpublished owner. The enclosing directory
+    /// controls membership; the recipient must publish and recover the contents.
+    pub async fn create_native(&self) -> Result<DirLock<FE>> {
+        Ok(self.canon.write().await.create_dir(NATIVE.to_string())?)
+    }
+
     /// Destructure this [`Dir`] into its underlying [`DirLock`].
     /// The caller of this method must implement transactional state management explicitly.
     pub fn into_inner(self) -> DirLock<FE> {
@@ -132,7 +153,7 @@ where
             let canonical = canon
                 .try_read()?
                 .iter()
-                .filter(|(name, _)| name.as_str() != VERSIONS)
+                .filter(|(name, _)| name.as_str() != VERSIONS && name.as_str() != NATIVE)
                 .map(|(name, entry)| (name.clone(), entry.clone()))
                 .collect::<Vec<_>>();
 
@@ -183,6 +204,10 @@ where
     pub async fn create_dir(&self, txn_id: TxnId, name: Id) -> Result<Self> {
         #[cfg(feature = "logging")]
         log::trace!("Dir::create_dir {name}");
+
+        if name.as_str() == NATIVE || name.as_str() == VERSIONS {
+            return Err(Error::Corrupt(format!("reserved storage name {name}")));
+        }
 
         let entry = match self.entries.entry(txn_id, name.clone()).await? {
             TxnMapEntry::Occupied(_) => {
@@ -336,6 +361,10 @@ where
         #[cfg(feature = "logging")]
         log::trace!("Dir::create_file {name}");
 
+        if name.as_str() == NATIVE || name.as_str() == VERSIONS {
+            return Err(Error::Corrupt(format!("reserved storage name {name}")));
+        }
+
         // this write permit ensures that there is no other pending entry with this name
         let entry = match self.entries.entry(txn_id, name.clone()).await? {
             TxnMapEntry::Occupied(_) => {
@@ -484,7 +513,7 @@ where
 
             if needs_sync {
                 // remove the canonical version of any file that was deleted in this transaction
-                self.canon.sync_all().await?;
+                self.canon.sync_deleted().await?;
             }
             Ok(())
         })
@@ -575,7 +604,7 @@ where
             let mut to_delete = Vec::with_capacity(canon.len());
 
             for (name, entry) in canon.iter() {
-                if names.contains(name) || name == VERSIONS {
+                if names.contains(name) || name == VERSIONS || name == NATIVE {
                     continue;
                 }
 
@@ -595,7 +624,7 @@ where
         }
 
         if sync_canon {
-            self.canon.sync_all().await?;
+            self.canon.sync_deleted().await?;
         }
         Ok(())
     }
