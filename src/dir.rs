@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::{fmt, io};
 
 use freqfs::{DirLock, FileLoad, FileSave};
-use futures::future::{try_join_all, Future, TryFutureExt};
+use futures::future::TryFutureExt;
 use futures::stream::{self, FuturesUnordered, Stream, StreamExt};
 use get_size::GetSize;
 use hr_id::Id;
@@ -25,7 +24,7 @@ pub const VERSIONS: &str = ".txfs";
 
 /// An entry in a [`Dir`]
 pub enum DirEntry<TxnId, FE> {
-    Dir(Dir<TxnId, FE>),
+    Dir(DirLock<FE>),
     File(File<TxnId, FE>),
 }
 
@@ -59,7 +58,10 @@ impl<TxnId, FE> fmt::Debug for DirEntry<TxnId, FE> {
     }
 }
 
-/// A transactional directory
+/// Transactional membership and file versions in one directory.
+///
+/// Child directories are native handles. Their recipients own loading and
+/// lifecycle delegation; this directory never versions or synchronizes their contents.
 pub struct Dir<TxnId, FE> {
     canon: DirLock<FE>,
     versions: DirLock<FE>,
@@ -82,6 +84,7 @@ where
 {
     /// Destructure this [`Dir`] into its underlying [`DirLock`].
     /// The caller of this method must implement transactional state management explicitly.
+    /// Other clones retain this directory's transactional state; this does not revoke them.
     pub fn into_inner(self) -> DirLock<FE> {
         debug_assert!(self.canon.try_read().expect("canon").contains(VERSIONS));
         self.canon
@@ -118,71 +121,75 @@ where
     TxnId: Hash + Ord + Copy + fmt::Display + fmt::Debug + Send + Sync + 'static,
     FE: FileSave + Clone,
 {
-    /// Load a transactional [`Dir`] from a [`DirLock`].
-    pub fn load(canon: DirLock<FE>) -> Pin<Box<dyn Future<Output = Result<Self>> + Send>> {
+    /// Load immediate membership and file versions from a [`DirLock`].
+    /// Child contents are left untouched for their owners to load and validate.
+    pub async fn load(canon: DirLock<FE>) -> Result<Self> {
         #[cfg(feature = "log")]
         log::debug!("load transactional dir from {:?}", canon);
 
-        Box::pin(async move {
-            let versions = {
-                let mut dir = canon.write().await;
-                dir.get_or_create_dir(VERSIONS.to_string())?
-            };
-            let mut contents = HashMap::new();
-            let canonical = canon
-                .try_read()?
-                .iter()
-                .filter(|(name, _)| name.as_str() != VERSIONS)
-                .map(|(name, entry)| (name.clone(), entry.clone()))
-                .collect::<Vec<_>>();
+        let versions = {
+            let mut dir = canon.write().await;
+            dir.get_or_create_dir(VERSIONS.to_string())?
+        };
+        let mut contents = HashMap::new();
+        let canonical = canon
+            .try_read()?
+            .iter()
+            .filter(|(name, _)| name.as_str() != VERSIONS)
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect::<Vec<_>>();
 
-            {
-                let versions = versions.read().await;
-                for (name, entry) in versions.iter() {
-                    let canonical_file = canonical.iter().any(|(canonical, entry)| {
-                        canonical == name && matches!(entry, freqfs::DirEntry::File(_))
-                    });
-                    match entry {
-                        freqfs::DirEntry::Dir(dir)
-                            if canonical_file && dir.read().await.is_empty() => {}
-                        _ => {
-                            return Err(Error::Corrupt(format!(
-                                "inconsistent transactional storage at {VERSIONS}/{name}"
-                            )));
-                        }
+        {
+            let versions = versions.read().await;
+            for (name, entry) in versions.iter() {
+                let canonical_file = canonical.iter().any(|(canonical, entry)| {
+                    canonical == name && matches!(entry, freqfs::DirEntry::File(_))
+                });
+                match entry {
+                    freqfs::DirEntry::Dir(dir) if canonical_file && dir.read().await.is_empty() => {
+                    }
+                    _ => {
+                        return Err(Error::Corrupt(format!(
+                            "inconsistent transactional storage at {VERSIONS}/{name}"
+                        )));
                     }
                 }
             }
+        }
 
-            for (name, entry) in canonical {
-                let name: Id = name.parse()?;
-                let entry = match entry {
-                    freqfs::DirEntry::Dir(dir) => Self::load(dir).map_ok(DirEntry::Dir).await?,
-                    freqfs::DirEntry::File(_) => {
-                        let file_versions = {
-                            let mut versions = versions.write().await;
-                            versions.get_or_create_dir(name.to_string())?
-                        };
-                        File::load(name.clone(), canon.clone(), file_versions)
-                            .map_ok(DirEntry::File)
-                            .await?
-                    }
-                };
-                contents.insert(name, entry);
-            }
+        for (name, entry) in canonical {
+            let name: Id = name.parse()?;
+            let entry = match entry {
+                freqfs::DirEntry::Dir(dir) => DirEntry::Dir(dir),
+                freqfs::DirEntry::File(_) => {
+                    let file_versions = {
+                        let mut versions = versions.write().await;
+                        versions.get_or_create_dir(name.to_string())?
+                    };
+                    File::load(name.clone(), canon.clone(), file_versions)
+                        .map_ok(DirEntry::File)
+                        .await?
+                }
+            };
+            contents.insert(name, entry);
+        }
 
-            Ok(Self {
-                canon,
-                versions,
-                entries: TxnMapLock::from_committed(contents),
-            })
+        Ok(Self {
+            canon,
+            versions,
+            entries: TxnMapLock::from_committed(contents),
         })
     }
 
-    /// Create a new [`Dir`] with the given `name` at `txn_id`.
-    pub async fn create_dir(&self, txn_id: TxnId, name: Id) -> Result<Self> {
+    /// Create a child directory with transactional membership at `txn_id`.
+    /// Its recipient owns native contents, or explicitly loads another [`Dir`].
+    pub async fn create_dir(&self, txn_id: TxnId, name: Id) -> Result<DirLock<FE>> {
         #[cfg(feature = "logging")]
         log::trace!("Dir::create_dir {name}");
+
+        if name.as_str() == VERSIONS {
+            return Err(Error::Corrupt(format!("reserved storage name {name}")));
+        }
 
         let entry = match self.entries.entry(txn_id, name.clone()).await? {
             TxnMapEntry::Occupied(_) => {
@@ -195,10 +202,11 @@ where
             TxnMapEntry::Vacant(entry) => entry,
         };
 
-        let mut canon = self.canon.write().await;
-
-        let sub_dir = canon.get_or_create_dir(name.to_string())?;
-        let sub_dir = Self::load(sub_dir).await?;
+        let sub_dir = self
+            .canon
+            .write()
+            .await
+            .get_or_create_dir(name.to_string())?;
 
         entry.insert(DirEntry::Dir(sub_dir.clone()));
 
@@ -219,17 +227,11 @@ where
             .await
     }
 
-    /// Delete the entry at `name` at `txn_id` and return `true` if it was present.
+    /// Stage removal of the entry at `name`, returning whether it was present.
+    /// Child contents remain intact until commit removes the physical subtree.
+    /// Callers must release child operations before committing its deletion.
     pub async fn delete(&self, txn_id: TxnId, name: Id) -> Result<bool> {
-        if let Some(entry) = self.entries.remove(txn_id, &name).await? {
-            if let DirEntry::Dir(dir) = &*entry {
-                dir.clone().truncate(txn_id).await?;
-            }
-
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(self.entries.remove(txn_id, &name).await?.is_some())
     }
 
     /// Construct an iterator over the names of the sub-directories in this [`Dir`] at `txn_id`.
@@ -275,7 +277,7 @@ where
         &self,
         txn_id: TxnId,
         name: &Id,
-    ) -> Result<Option<TxnMapValueReadGuardMap<Id, Self>>> {
+    ) -> Result<Option<TxnMapValueReadGuardMap<Id, DirLock<FE>>>> {
         if let Some(entry) = self.entries.get(txn_id, name).map_err(Error::from).await? {
             expect_dir(entry).map(Some)
         } else {
@@ -288,7 +290,7 @@ where
         &self,
         txn_id: TxnId,
         name: &Id,
-    ) -> Result<Option<TxnMapValueReadGuardMap<Id, Self>>> {
+    ) -> Result<Option<TxnMapValueReadGuardMap<Id, DirLock<FE>>>> {
         if let Some(entry) = self.entries.try_get(txn_id, name).map_err(Error::from)? {
             expect_dir(entry).map(Some)
         } else {
@@ -296,24 +298,10 @@ where
         }
     }
 
-    /// Delete the contents of this [`Dir`] at `txn_id`.
-    pub fn truncate(self, txn_id: TxnId) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        Box::pin(async move {
-            let entries = self.entries.clear(txn_id).map_err(Error::from).await?;
-
-            let truncates = entries
-                .into_values()
-                .filter_map(|entry| {
-                    if let DirEntry::Dir(dir) = &*entry {
-                        Some(dir.clone())
-                    } else {
-                        None
-                    }
-                })
-                .map(move |dir| dir.truncate(txn_id));
-
-            try_join_all(truncates).map_ok(|_| ()).await
-        })
+    /// Stage removal of all entries, without changing child transaction state.
+    pub async fn truncate(self, txn_id: TxnId) -> Result<()> {
+        self.entries.clear(txn_id).await?;
+        Ok(())
     }
 }
 
@@ -335,6 +323,10 @@ where
     {
         #[cfg(feature = "logging")]
         log::trace!("Dir::create_file {name}");
+
+        if name.as_str() == VERSIONS {
+            return Err(Error::Corrupt(format!("reserved storage name {name}")));
+        }
 
         // this write permit ensures that there is no other pending entry with this name
         let entry = match self.entries.entry(txn_id, name.clone()).await? {
@@ -428,116 +420,84 @@ where
     TxnId: FromStr + fmt::Display + Hash + Copy + Ord + fmt::Debug + Send + Sync,
     FE: FileSave + Clone,
 {
-    /// Commit the state of this [`Dir`] at `txn_id`.
-    pub fn commit<'a>(
-        &'a self,
-        txn_id: TxnId,
-        recursive: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
+    /// Commit immediate file versions and membership at `txn_id`.
+    /// Child owners must complete their own lifecycle under caller coordination.
+    pub async fn commit(&self, txn_id: TxnId) -> Result<()> {
+        #[cfg(feature = "logging")]
+        log::trace!("Dir::commit");
+
+        let (contents, deltas) = self.entries.read_and_commit(txn_id).await;
+
+        let mut commits = FuturesUnordered::new();
+
+        for (_name, entry) in &contents {
             #[cfg(feature = "logging")]
-            log::trace!("Dir::commit, recursive={recursive}");
+            log::trace!("Dir::commit {}: {:?}", _name, entry);
 
-            let (contents, deltas) = self.entries.read_and_commit(txn_id).await;
+            if let DirEntry::File(file) = &**entry {
+                commits.push(file.commit(txn_id));
+            }
+        }
 
-            if recursive {
-                let mut commits = FuturesUnordered::new();
+        while let Some(result) = commits.next().await {
+            result?;
+        }
 
-                for (_name, entry) in &contents {
-                    #[cfg(feature = "logging")]
-                    log::trace!("Dir::commit {}: {:?}", _name, entry);
+        // New directory entries need durable publication as well as deletions.
+        let needs_sync = deltas.as_ref().is_some_and(|deltas| !deltas.is_empty());
+        if let Some(deltas) = deltas {
+            let mut canon = self.canon.write().await;
 
-                    let entry = DirEntry::clone(entry);
+            for (name, entry) in deltas {
+                if entry.is_none() {
+                    assert!(!contents.contains_key(&*name));
 
-                    commits.push(async move {
-                        match entry {
-                            DirEntry::Dir(dir) => dir.commit(txn_id, recursive).await,
-                            DirEntry::File(file) => file.commit(txn_id).await,
-                        }
-                    });
-                }
-
-                while let Some(result) = commits.next().await {
-                    result?;
+                    canon.delete(&*name).await;
                 }
             }
+        };
 
-            // New directory entries need durable publication as well as deletions.
-            let mut needs_sync = deltas.as_ref().is_some_and(|deltas| !deltas.is_empty());
-            if let Some(deltas) = deltas {
-                let mut canon = self.canon.write().await;
-
-                for (name, entry) in deltas {
-                    if entry.is_none() {
-                        assert!(!contents.contains_key(&*name));
-
-                        if canon.get(&*name).is_some() {
-                            // freqfs tracks deletions until sync; synchronize after deleting
-                            // any canonical entry so same-name recreation is possible.
-                            needs_sync = true;
-                        }
-
-                        canon.delete(&*name).await;
-                    }
-                }
-            };
-
-            if needs_sync {
-                // remove the canonical version of any file that was deleted in this transaction
-                self.canon.sync_all().await?;
-            }
-            Ok(())
-        })
+        if needs_sync {
+            // Publish membership changes and finish deletions before same-name reuse.
+            self.canon.sync_deleted().await?;
+        }
+        Ok(())
     }
 
-    /// Roll back the state of this [`Dir`] at `txn_id`.
-    pub fn rollback<'a>(
-        &'a self,
-        txn_id: TxnId,
-        recursive: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let (contents, _deltas) = self.entries.read_and_rollback(txn_id).await;
+    /// Roll back immediate file versions and membership at `txn_id`.
+    pub async fn rollback(&self, txn_id: TxnId) -> Result<()> {
+        let (contents, _deltas) = self.entries.read_and_rollback(txn_id).await;
 
-            if recursive {
-                let mut rollbacks = FuturesUnordered::new();
+        let mut rollbacks = FuturesUnordered::new();
 
-                for (_name, entry) in contents {
-                    let entry = DirEntry::clone(&entry);
-
-                    rollbacks.push(async move {
-                        match entry {
-                            DirEntry::Dir(dir) => dir.rollback(txn_id, recursive).await,
-                            DirEntry::File(file) => file.rollback(txn_id).await,
-                        }
-                    });
-                }
-
-                while let Some(result) = rollbacks.next().await {
-                    result?;
-                }
+        for entry in contents.values() {
+            if let DirEntry::File(file) = &**entry {
+                rollbacks.push(file.rollback(txn_id));
             }
-            Ok(())
-        })
+        }
+
+        while let Some(result) = rollbacks.next().await {
+            result?;
+        }
+        Ok(())
     }
 
-    /// Finalize the state of this [`Dir`] at `txn_id`.
+    /// Finalize immediate file versions and membership through `txn_id`.
+    /// This does not finalize or synchronize surviving child directories.
     pub async fn finalize(&self, txn_id: TxnId) -> Result<()> {
         let mut sync_canon = false;
 
         if let Some(entries) = self.entries.read_and_finalize(txn_id) {
-            let mut finalizes = FuturesUnordered::new();
-            for entry in entries.values() {
-                let entry = DirEntry::clone(entry);
-                finalizes.push(async move {
-                    match entry {
-                        DirEntry::Dir(dir) => dir.finalize(txn_id).await,
-                        DirEntry::File(file) => file.finalize(txn_id).await,
+            {
+                let mut finalizes = FuturesUnordered::new();
+                for entry in entries.values() {
+                    if let DirEntry::File(file) = &**entry {
+                        finalizes.push(file.finalize(txn_id));
                     }
-                });
-            }
-            while let Some(result) = finalizes.next().await {
-                result?;
+                }
+                while let Some(result) = finalizes.next().await {
+                    result?;
+                }
             }
             let names = entries
                 .into_keys()
@@ -595,7 +555,7 @@ where
         }
 
         if sync_canon {
-            self.canon.sync_all().await?;
+            self.canon.sync_deleted().await?;
         }
         Ok(())
     }
@@ -610,7 +570,7 @@ impl<TxnId, FE> fmt::Debug for Dir<TxnId, FE> {
 #[inline]
 fn expect_dir<TxnId, FE>(
     entry: TxnMapValueReadGuard<Id, DirEntry<TxnId, FE>>,
-) -> Result<TxnMapValueReadGuardMap<Id, Dir<TxnId, FE>>> {
+) -> Result<TxnMapValueReadGuardMap<Id, DirLock<FE>>> {
     entry.try_map(|entry| match entry {
         DirEntry::Dir(dir) => Ok(dir.clone()),
         DirEntry::File(file) => Err(io::Error::new(

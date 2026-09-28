@@ -252,17 +252,20 @@ mod tests {
         match &*file.read::<Entry>(Txn(7)).await? {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[4u8, 5, 6]),
         }
-        file.rollback(Txn(8)).await?;
+        dir.rollback(Txn(8)).await?;
+        dir.rollback(Txn(8)).await?;
 
         {
             let mut committed = file.write::<Entry>(Txn(9)).await?;
             *committed = Entry::Bin(vec![9]);
         }
-        file.commit(Txn(9)).await?;
+        dir.commit(Txn(9)).await?;
+        dir.commit(Txn(9)).await?;
         match &*file.read::<Entry>(Txn(10)).await? {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[9]),
         }
-        file.finalize(Txn(9)).await?;
+        dir.finalize(Txn(9)).await?;
+        dir.finalize(Txn(9)).await?;
         match &*file.read::<Entry>(Txn(10)).await? {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[9]),
         }
@@ -281,18 +284,94 @@ mod tests {
             std::process::id(),
             unique
         ));
-        let pending = path.join(super::dir::VERSIONS).join("file-one").join("5");
+        let child_path = path.join("child");
+        let pending = child_path
+            .join(super::dir::VERSIONS)
+            .join("file-one")
+            .join("5");
         fs::create_dir_all(pending.parent().expect("pending parent")).await?;
         fs::write(&pending, [9u8]).await?;
 
         let cache = Cache::<Entry>::new(1024, None, 0, std::time::Duration::from_secs(3));
         let root = cache.load(path.clone())?;
+        let dir = super::Dir::<Txn, Entry>::load(root).await?;
+        let child = dir
+            .get_dir(Txn(1), &"child".parse()?)
+            .await?
+            .expect("child")
+            .clone();
+        // Only the recipient interprets this child's unresolved versions.
         assert!(matches!(
-            super::Dir::<Txn, Entry>::load(root).await,
+            super::Dir::<Txn, Entry>::load(child).await,
             Err(super::Error::Corrupt(_))
         ));
         assert_eq!(fs::read(&pending).await?, [9u8]);
 
+        fs::remove_dir_all(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn directory_membership_leaves_native_contents_to_the_recipient(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("txfs_members_{}_{unique}", std::process::id()));
+        fs::create_dir(&path).await?;
+        let cache = Cache::<Entry>::new(4096, None, 0, std::time::Duration::from_secs(3));
+        let root = cache.load(path.clone())?;
+        let dir = super::Dir::<Txn, Entry>::load(root.clone()).await?;
+        let name: super::Id = "child".parse()?;
+        let child = dir.create_dir(Txn(1), name.clone()).await?;
+        assert!(!child.read().await.contains(super::VERSIONS));
+        let file = child
+            .write()
+            .await
+            .create_file("native".into(), Entry::Bin(vec![1, 2, 3]), 3)
+            .await?;
+        file.sync_all().await?;
+
+        // No parent lifecycle or loading operation may acquire this child's lock.
+        {
+            let _child = child.write().await;
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                dir.commit(Txn(1)).await?;
+                dir.commit(Txn(1)).await?;
+                dir.finalize(Txn(1)).await?;
+                dir.finalize(Txn(1)).await?;
+                let reopened = super::Dir::<Txn, Entry>::load(root.clone()).await?;
+                assert!(reopened.get_dir(Txn(2), &name).await?.is_some());
+                assert!(dir.delete(Txn(2), name.clone()).await?);
+                dir.rollback(Txn(2)).await?;
+                dir.clone().truncate(Txn(3)).await?;
+                dir.rollback(Txn(3)).await?;
+                Ok::<_, super::Error>(())
+            })
+            .await??;
+        }
+        assert!(!child.read().await.contains(super::VERSIONS));
+        assert_eq!(fs::read(path.join("child/native")).await?, [1, 2, 3]);
+        assert!(dir.get_dir(Txn(4), &name).await?.is_some());
+        assert!(dir.delete(Txn(4), name.clone()).await?);
+        dir.commit(Txn(4)).await?;
+        dir.commit(Txn(4)).await?;
+        dir.finalize(Txn(4)).await?;
+        assert!(!path.join("child").exists());
+
+        let replacement = dir.create_dir(Txn(5), name.clone()).await?;
+        assert!(replacement.read().await.is_empty());
+        replacement
+            .write()
+            .await
+            .create_file("native".into(), Entry::Bin(vec![4]), 1)
+            .await?
+            .sync_all()
+            .await?;
+        dir.commit(Txn(5)).await?;
+        dir.finalize(Txn(5)).await?;
+        let reopened = super::Dir::<Txn, Entry>::load(root).await?;
+        assert!(reopened.get_dir(Txn(6), &name).await?.is_some());
+        assert_eq!(fs::read(path.join("child/native")).await?, [4]);
         fs::remove_dir_all(path).await?;
         Ok(())
     }

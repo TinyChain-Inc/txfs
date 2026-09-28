@@ -120,22 +120,24 @@ async fn run_example(cache: DirLock<File>) -> Result<(), txfs::Error> {
     // but a write in the past will block a read in the future
     assert!(root.try_get_file(second_txn, &file_one).is_err());
 
-    // committing a Dir with recursive=true commits all its children
-    root.commit(first_txn, true).await?;
+    // A Dir commits its immediate file versions and membership.
+    root.commit(first_txn).await?;
 
-    let subdir = root.create_dir(second_txn, subdir_name.clone()).await?;
+    let subdir = Dir::load(root.create_dir(second_txn, subdir_name.clone()).await?).await?;
 
     subdir
         .create_file(second_txn, file_two.clone(), vec![2, 3, 4])
         .await?;
 
-    root.commit(second_txn, true).await?;
+    // The recipient of a child directory owns its lifecycle.
+    subdir.commit(second_txn).await?;
+    root.commit(second_txn).await?;
 
     // deleting a directory will delete all its children, recursively
     root.delete(third_txn, subdir_name.clone()).await?;
 
     // accessing "subdir" after this can cause the filesystem to get out of sync with the cache!
-    root.commit(third_txn, true).await?;
+    root.commit(third_txn).await?;
 
     // call "finalize" to drop all information about commits earlier than the given transaction ID
     root.finalize(third_txn).await?;
@@ -143,13 +145,14 @@ async fn run_example(cache: DirLock<File>) -> Result<(), txfs::Error> {
     let fourth_txn = Txn(4);
 
     // anything that was deleted is now safe to re-create
-    let subdir = root.create_dir(fourth_txn, subdir_name).await?;
+    let subdir = Dir::load(root.create_dir(fourth_txn, subdir_name).await?).await?;
 
     let file = subdir
         .create_file(fourth_txn, file_two, vec![3, 4, 5])
         .await?;
 
-    root.commit(fourth_txn, true).await?;
+    subdir.commit(fourth_txn).await?;
+    root.commit(fourth_txn).await?;
 
     let fifth_txn = Txn(5);
 
@@ -163,8 +166,8 @@ async fn run_example(cache: DirLock<File>) -> Result<(), txfs::Error> {
 async fn main() -> Result<(), txfs::Error> {
     let path = setup_tmp_dir().await?;
 
-    // initialize the cache
-    let cache = Cache::new(40, None, 0, Duration::from_secs(3));
+    // Admit the example's file values and their transactional copies.
+    let cache = Cache::new(4096, None, 0, Duration::from_secs(3));
 
     // load the directory and file paths into memory (not file contents, yet)
     let root = cache.load(path.clone())?;
