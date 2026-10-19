@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use destream::{de, en};
 use freqfs::{Cache, DirLock};
+use get_size::GetSize;
 use hr_id::Id;
 use rand::Rng;
 use safecast::as_type;
@@ -203,7 +204,33 @@ impl de::Visitor for FileVisitor {
     }
 }
 
+impl GetSize for File {
+    fn get_heap_size(&self) -> usize {
+        match self {
+            Self::Bin(value) => value.get_heap_size(),
+            Self::Text(value) => value.get_heap_size(),
+        }
+    }
+}
+
 impl freqfs::FileLoad for File {
+    async fn load_size(
+        _: &std::path::Path,
+        _: &mut tokio::fs::File,
+        metadata: &std::fs::Metadata,
+    ) -> io::Result<usize> {
+        // The scalar/byte-sequence codec contains no nested allocations; its Vec
+        // growth is bounded by twice the encoded bytes, with an eight-byte minimum.
+        let len = usize::try_from(metadata.len()).map_err(io::Error::other)?;
+        std::mem::size_of::<Self>()
+            .checked_add(
+                len.checked_mul(2)
+                    .ok_or_else(|| io::Error::other("file too large"))?
+                    .max(8),
+            )
+            .ok_or_else(|| io::Error::other("file too large"))
+    }
+
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,

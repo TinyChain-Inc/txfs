@@ -20,6 +20,8 @@ manage membership. Callers coordinate child lifecycle separately, releasing chil
 operations before committing deletion of a subtree. `delete` and `truncate`
 stage membership removal; rollback leaves native contents intact, while commit
 removes the corresponding physical storage through `freqfs`.
+Version cleanup applies deletions only, so retained historical owners cannot
+recreate a subtree after its parent has removed it.
 
 Ordinary writeback remains buffered. Immediate file commit explicitly makes its
 canonical version durable; directory membership synchronization applies deletions
