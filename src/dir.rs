@@ -119,7 +119,7 @@ impl<TxnId: Copy + Hash + Eq + Ord + fmt::Debug, FE> Dir<TxnId, FE> {
 impl<TxnId, FE> Dir<TxnId, FE>
 where
     TxnId: Hash + Ord + Copy + fmt::Display + fmt::Debug + Send + Sync + 'static,
-    FE: FileSave + Clone,
+    FE: FileSave + GetSize + Clone,
 {
     /// Load immediate membership and file versions from a [`DirLock`].
     /// Child contents are left untouched for their owners to load and validate.
@@ -418,7 +418,7 @@ where
 impl<TxnId, FE> Dir<TxnId, FE>
 where
     TxnId: FromStr + fmt::Display + Hash + Copy + Ord + fmt::Debug + Send + Sync,
-    FE: FileSave + Clone,
+    FE: FileSave + GetSize + Clone,
 {
     /// Commit immediate file versions and membership at `txn_id`.
     /// Child owners must complete their own lifecycle under caller coordination.
@@ -430,9 +430,9 @@ where
 
         let mut commits = FuturesUnordered::new();
 
-        for (_name, entry) in &contents {
+        for entry in contents.values() {
             #[cfg(feature = "logging")]
-            log::trace!("Dir::commit {}: {:?}", _name, entry);
+            log::trace!("Dir::commit: {:?}", entry);
 
             if let DirEntry::File(file) = &**entry {
                 commits.push(file.commit(txn_id));
@@ -528,7 +528,7 @@ where
                     versions.delete(name.as_str()).await;
                 }
 
-                versions.sync().await?;
+                versions.sync_deleted().await?;
             }
 
             let mut canon = self.canon.write().await;

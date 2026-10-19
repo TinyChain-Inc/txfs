@@ -124,13 +124,33 @@ mod tests {
     }
 
     impl freqfs::FileLoad for Entry {
+        async fn load_size(
+            _: &std::path::Path,
+            _: &mut tokio::fs::File,
+            metadata: &std::fs::Metadata,
+        ) -> std::io::Result<usize> {
+            usize::try_from(metadata.len())
+                .ok()
+                .and_then(|len| len.checked_add(std::mem::size_of::<Self>()))
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "file too large")
+                })
+        }
         async fn load(
             _path: &std::path::Path,
             mut file: tokio::fs::File,
-            _metadata: std::fs::Metadata,
+            metadata: std::fs::Metadata,
         ) -> std::io::Result<Self> {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).await?;
+            let len = usize::try_from(metadata.len()).map_err(std::io::Error::other)?;
+            let mut bytes = vec![0; len];
+            file.read_exact(&mut bytes).await?;
+            let mut extra = [0];
+            if file.read(&mut extra).await? != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "file grew during load",
+                ));
+            }
             Ok(Self::Bin(bytes))
         }
     }
@@ -147,9 +167,9 @@ mod tests {
     }
 
     impl GetSize for Entry {
-        fn get_size(&self) -> usize {
+        fn get_heap_size(&self) -> usize {
             match self {
-                Self::Bin(bytes) => bytes.get_size(),
+                Self::Bin(bytes) => bytes.get_heap_size(),
             }
         }
     }
@@ -327,7 +347,7 @@ mod tests {
         let file = child
             .write()
             .await
-            .create_file("native".into(), Entry::Bin(vec![1, 2, 3]), 3)
+            .create_file("native".into(), Entry::Bin(vec![1, 2, 3]))
             .await?;
         file.sync_all().await?;
 
@@ -363,7 +383,7 @@ mod tests {
         replacement
             .write()
             .await
-            .create_file("native".into(), Entry::Bin(vec![4]), 1)
+            .create_file("native".into(), Entry::Bin(vec![4]))
             .await?
             .sync_all()
             .await?;
@@ -373,6 +393,55 @@ mod tests {
         assert!(reopened.get_dir(Txn(6), &name).await?.is_some());
         assert_eq!(fs::read(path.join("child/native")).await?, [4]);
         fs::remove_dir_all(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_cleanup_does_not_recreate_a_deleted_subtree(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for cleanup in ["file finalize", "directory finalize", "file rollback"] {
+            let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "txfs_retired_{}_{}",
+                std::process::id(),
+                unique
+            ));
+            fs::create_dir(&path).await?;
+            let cache = Cache::<Entry>::new(4096, None, 0, std::time::Duration::from_secs(3));
+            let parent = super::Dir::<Txn, Entry>::load(cache.load(path.clone())?).await?;
+            let name: super::Id = "child".parse()?;
+            let child = super::Dir::load(parent.create_dir(Txn(1), name.clone()).await?).await?;
+            let file = child
+                .create_file(Txn(1), "data".parse()?, Entry::Bin(vec![1]))
+                .await?;
+            child.commit(Txn(1)).await?;
+            parent.commit(Txn(1)).await?;
+            if cleanup == "file rollback" {
+                *file.write::<Entry>(Txn(2)).await? = Entry::Bin(vec![2]);
+            }
+            assert!(parent.delete(Txn(3), name.clone()).await?);
+            parent.commit(Txn(3)).await?;
+            assert!(!path.join("child").exists());
+
+            // Historical owners can still reach their cutoff after their parent
+            // has committed deletion. Cleanup must not publish storage again.
+            match cleanup {
+                "file finalize" => file.finalize(Txn(1)).await?,
+                "directory finalize" => child.finalize(Txn(1)).await?,
+                "file rollback" => file.rollback(Txn(2)).await?,
+                _ => unreachable!(),
+            }
+            assert!(
+                !path.join("child").exists(),
+                "{cleanup} recreated its subtree"
+            );
+            let reopened_cache =
+                Cache::<Entry>::new(4096, None, 0, std::time::Duration::from_secs(3));
+            let reopened =
+                super::Dir::<Txn, Entry>::load(reopened_cache.load(path.clone())?).await?;
+            assert!(reopened.get_dir(Txn(4), &name).await?.is_none());
+            fs::remove_dir_all(path).await?;
+        }
         Ok(())
     }
 }

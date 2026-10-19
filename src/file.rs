@@ -27,12 +27,12 @@ impl<TxnId, FE, F> Deref for FileVersionRead<TxnId, FE, F> {
 }
 
 /// A write guard on a version of a transactional [`File`]
-pub struct FileVersionWrite<TxnId, FE, F> {
+pub struct FileVersionWrite<TxnId, FE: GetSize, F> {
     _modified: TxnLockWriteGuard<Option<TxnId>>,
     version: FileWriteGuardOwned<FE, F>,
 }
 
-impl<TxnId, FE, F> Deref for FileVersionWrite<TxnId, FE, F> {
+impl<TxnId, FE: GetSize + AsType<F>, F> Deref for FileVersionWrite<TxnId, FE, F> {
     type Target = F;
 
     fn deref(&self) -> &Self::Target {
@@ -40,7 +40,7 @@ impl<TxnId, FE, F> Deref for FileVersionWrite<TxnId, FE, F> {
     }
 }
 
-impl<TxnId, FE, F> DerefMut for FileVersionWrite<TxnId, FE, F> {
+impl<TxnId, FE: GetSize + AsType<F>, F> DerefMut for FileVersionWrite<TxnId, FE, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.version.deref_mut()
     }
@@ -90,11 +90,8 @@ where
             .ends_with(name.as_str()));
 
         {
-            let size = version.get_size();
             let mut versions = versions.write().await;
-            versions
-                .create_file(txn_id.to_string(), version, size)
-                .await?;
+            versions.create_file(txn_id.to_string(), version).await?;
         }
 
         Ok(Self {
@@ -221,11 +218,8 @@ where
             };
             *last_modified = Some(txn_id);
             let version = F::clone(&*canon);
-            let size = version.get_size();
             let mut versions = self.versions.write().await;
-            versions
-                .create_file(txn_id.to_string(), version, size)
-                .await?
+            versions.create_file(txn_id.to_string(), version).await?
         } else if *last_modified == Some(txn_id) {
             let versions = self.versions.read().await;
             versions
@@ -255,7 +249,7 @@ where
 impl<TxnId, FE> File<TxnId, FE>
 where
     TxnId: Hash + Ord + fmt::Display + fmt::Debug + Copy + Send + Sync,
-    FE: FileSave + Clone + Send + Sync,
+    FE: FileSave + GetSize + Clone + Send + Sync,
 {
     /// Commit the state of this file at `txn_id`.
     /// This will un-block any pending future write locks.
@@ -294,7 +288,7 @@ where
         if *last_modified == Some(txn_id) {
             let mut versions = self.versions.write().await;
             versions.delete(&txn_id.to_string()).await;
-            if let Err(error) = versions.sync().await {
+            if let Err(error) = versions.sync_deleted().await {
                 if error.kind() != io::ErrorKind::NotFound {
                     return Err(error.into());
                 }
@@ -307,7 +301,7 @@ where
 impl<TxnId, FE> File<TxnId, FE>
 where
     TxnId: Hash + Ord + FromStr + fmt::Display + fmt::Debug + Copy + Send + Sync,
-    FE: FileSave + Clone + Send + Sync,
+    FE: FileSave + GetSize + Clone + Send + Sync,
 {
     pub async fn finalize(&self, txn_id: TxnId) -> Result<()> {
         if let Some(last_modified) = self.last_modified.read_and_finalize(txn_id) {
@@ -327,7 +321,7 @@ where
             for version_id in to_delete {
                 versions.delete(&version_id).await;
             }
-            if let Err(error) = versions.sync().await {
+            if let Err(error) = versions.sync_deleted().await {
                 if error.kind() != io::ErrorKind::NotFound {
                     return Err(error.into());
                 }
