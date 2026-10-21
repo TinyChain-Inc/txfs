@@ -214,23 +214,6 @@ impl GetSize for File {
 }
 
 impl freqfs::FileLoad for File {
-    async fn load_size(
-        _: &std::path::Path,
-        _: &mut tokio::fs::File,
-        metadata: &std::fs::Metadata,
-    ) -> io::Result<usize> {
-        // The scalar/byte-sequence codec contains no nested allocations; its Vec
-        // growth is bounded by twice the encoded bytes, with an eight-byte minimum.
-        let len = usize::try_from(metadata.len()).map_err(io::Error::other)?;
-        std::mem::size_of::<Self>()
-            .checked_add(
-                len.checked_mul(2)
-                    .ok_or_else(|| io::Error::other("file too large"))?
-                    .max(8),
-            )
-            .ok_or_else(|| io::Error::other("file too large"))
-    }
-
     async fn load(
         _: &std::path::Path,
         file: tokio::fs::File,
