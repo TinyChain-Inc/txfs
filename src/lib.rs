@@ -124,18 +124,6 @@ mod tests {
     }
 
     impl freqfs::FileLoad for Entry {
-        async fn load_size(
-            _: &std::path::Path,
-            _: &mut tokio::fs::File,
-            metadata: &std::fs::Metadata,
-        ) -> std::io::Result<usize> {
-            usize::try_from(metadata.len())
-                .ok()
-                .and_then(|len| len.checked_add(std::mem::size_of::<Self>()))
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "file too large")
-                })
-        }
         async fn load(
             _path: &std::path::Path,
             mut file: tokio::fs::File,
