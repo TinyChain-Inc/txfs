@@ -20,16 +20,19 @@ is one consumer and does not define this crate's local contract.
    add round-trip coverage to keep `IntoStream`/`FromStream` pairs stable.
 4. **Avoid bespoke storage.** Keep new behavior expressed in terms of existing
    primitives and traits; prefer general-purpose traits over special cases.
-5. **Testing.** Run `cargo test --all-features`. Add focused unit tests for any
-   new transactional or locking behavior.
+5. **Testing.** Run affected library fixtures with explicit selectors. History
+   and lifecycle changes cover causal commit ordering, rollback, cutoff cleanup,
+   reopening, cancellation, and bounded admission. Compile immediate consumers
+   when a public interface changes. Complete suites remain release validation.
 6. **Docs.** Update `README.md` (and other relevant docs) when user-visible
    behavior changes.
 
 ## Pre-submit
 
 - `cargo fmt`
-- `cargo clippy --all-targets --all-features`
-- `cargo test --all-features`
+- Strict Clippy for affected library/test targets and meaningful features.
+- Affected explicit `cargo test --lib <selector>` cases and relevant doctests.
+- Complete `--all-targets --all-features` validation before releases.
 
 ## Rights and licensing
 

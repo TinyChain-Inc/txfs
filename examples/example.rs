@@ -7,11 +7,13 @@ use std::time::Duration;
 
 use destream::{de, en};
 use freqfs::{Cache, DirLock};
+use futures::TryStreamExt;
 use get_size::GetSize;
 use hr_id::Id;
 use rand::Rng;
 use safecast::as_type;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use txfs::Dir;
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
@@ -34,12 +36,6 @@ impl PartialOrd<str> for Txn {
         } else {
             None
         }
-    }
-}
-
-impl freqfs::Name for Txn {
-    fn partial_cmp(&self, key: &str) -> Option<Ordering> {
-        freqfs::Name::partial_cmp(&self.0, key)
     }
 }
 
@@ -110,12 +106,10 @@ async fn run_example(cache: DirLock<File>) -> Result<(), txfs::Error> {
     {
         let read_guard = file.read::<String>(first_txn).await?;
 
-        // but holding a read guard will block acquiring a write guard, and vice versa
-        // let read_guard = file.read::<String>(first_txn).await?;
+        // Release native read guards before applying the owning directory's lifecycle.
         assert_eq!(&*read_guard, "file one contents");
 
-        // a read in the past won't block a write in the future
-        assert!(file.write::<String>(second_txn).await.is_ok());
+        // A file handle grants reads; replacement goes through its directory owner.
     }
 
     // but a write in the past will block a read in the future
@@ -123,6 +117,11 @@ async fn run_example(cache: DirLock<File>) -> Result<(), txfs::Error> {
 
     // A Dir commits its immediate file versions and membership.
     root.commit(first_txn).await?;
+
+    // Replace complete contents through the directory; retained File handles remain read-only.
+    assert!(root.delete(second_txn, file_one.clone()).await?);
+    root.create_file(second_txn, file_one, String::from("replacement contents"))
+        .await?;
 
     let subdir = Dir::load(root.create_dir(second_txn, subdir_name.clone()).await?).await?;
 
@@ -133,6 +132,10 @@ async fn run_example(cache: DirLock<File>) -> Result<(), txfs::Error> {
     // The recipient of a child directory owns its lifecycle.
     subdir.commit(second_txn).await?;
     root.commit(second_txn).await?;
+    assert_eq!(
+        &*file.read::<String>(second_txn).await?,
+        "replacement contents"
+    );
 
     // deleting a directory will delete all its children, recursively
     root.delete(third_txn, subdir_name.clone()).await?;
@@ -182,24 +185,31 @@ async fn main() -> Result<(), txfs::Error> {
 
 impl de::FromStream for File {
     type Context = ();
+
     async fn from_stream<D: de::Decoder>(_: (), decoder: &mut D) -> Result<Self, D::Error> {
         decoder.decode_any(FileVisitor).await
     }
 }
+
 struct FileVisitor;
+
 impl de::Visitor for FileVisitor {
     type Value = File;
+
     fn expecting() -> &'static str {
         "a filesystem entry"
     }
+
     fn visit_string<E: de::Error>(self, value: String) -> Result<File, E> {
         Ok(File::Text(value))
     }
+
     async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<File, A::Error> {
         let mut bytes = Vec::new();
         while let Some(byte) = seq.next_element::<u8>(()).await? {
             bytes.push(byte);
         }
+
         Ok(File::Bin(bytes))
     }
 }
@@ -224,16 +234,17 @@ impl freqfs::FileLoad for File {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 }
+
 impl freqfs::FileSave for File {
     async fn save(&self, file: &mut tokio::fs::File) -> std::io::Result<u64> {
-        use futures::TryStreamExt;
-        use tokio::io::AsyncWriteExt;
         let mut stream = tbon::en::encode(self).map_err(std::io::Error::other)?;
         let mut size = 0;
+
         while let Some(chunk) = stream.try_next().await.map_err(std::io::Error::other)? {
             file.write_all(&chunk).await?;
             size += chunk.len() as u64;
         }
+
         Ok(size)
     }
 }

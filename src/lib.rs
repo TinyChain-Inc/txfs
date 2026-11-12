@@ -1,14 +1,20 @@
 //! A transactional filesystem cache layer based on [`freqfs`].
 //! See the "examples" directory for usage examples.
 
-use std::{fmt, io};
+use std::fmt;
+use std::io;
+
+pub use hr_id::Id;
 
 pub use dir::{Dir, DirEntry, Key, VERSIONS};
-pub use file::{File, FileVersionRead, FileVersionWrite};
-pub use hr_id::Id;
+pub use file::{File, FileVersionRead};
 
 mod dir;
 mod file;
+
+#[cfg(test)]
+#[path = "../tests/unit/lifecycle.rs"]
+pub(crate) mod lifecycle_tests;
 
 /// An error encountered during a transactional filesystem operation
 pub enum Error {
@@ -55,7 +61,16 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Conflict(cause) => Some(cause),
+            Self::IO(cause) => Some(cause),
+            Self::Parse(cause) => Some(cause),
+            Self::Corrupt(_) | Self::NotFound(_) => None,
+        }
+    }
+}
 
 /// The result of a transactional filesystem operation
 pub type Result<T> = std::result::Result<T, Error>;
@@ -68,10 +83,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use freqfs::Cache;
-    use freqfs::Name;
     use get_size::GetSize;
-    use safecast::as_type;
-    use safecast::AsType;
+    use safecast::{as_type, AsType};
     use tokio::fs;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -112,12 +125,6 @@ mod tests {
         }
     }
 
-    impl Name for Txn {
-        fn partial_cmp(&self, key: &str) -> Option<Ordering> {
-            Name::partial_cmp(&self.0, key)
-        }
-    }
-
     #[derive(Clone)]
     enum Entry {
         Bin(Vec<u8>),
@@ -139,6 +146,7 @@ mod tests {
                     "file grew during load",
                 ));
             }
+
             Ok(Self::Bin(bytes))
         }
     }
@@ -178,29 +186,34 @@ mod tests {
 
     as_type!(Entry, Bin, Vec<u8>);
 
-    #[test]
-    fn name_partial_cmp_accepts_str() {
-        let id = Txn(5);
-
-        assert_eq!(Name::partial_cmp(&id, "5"), Some(Ordering::Equal));
-        assert_eq!(Name::partial_cmp(&id, "7"), Some(Ordering::Less));
-        assert_eq!(Name::partial_cmp(&id, "nope"), None);
-    }
-
     #[tokio::test]
     async fn file_roundtrip_persists_bytes() -> Result<(), Box<dyn std::error::Error>> {
         let mut path = std::env::temp_dir();
         let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        path.push(format!("txfs_test_{}_{}", std::process::id(), unique));
+        path.push(format!("txfs_test_{}_{}_λ", std::process::id(), unique));
+
         fs::create_dir(&path).await?;
 
         let cache = Cache::<Entry>::new(1024, None, 0, std::time::Duration::from_secs(3));
         let root = cache.load(path.clone())?;
-        let dir = super::Dir::load(root).await?;
+        let dir = super::Dir::load(root.clone()).await?;
+
+        // Reserved names are caller input errors, not corruption of live storage.
+        let reserved = super::VERSIONS.parse()?;
+        assert!(matches!(
+            dir.create_dir(Txn(1), reserved).await,
+            Err(super::Error::IO(error)) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+
+        let reserved = super::VERSIONS.parse()?;
+        assert!(matches!(
+            dir.create_file(Txn(1), reserved, Entry::Bin(vec![])).await,
+            Err(super::Error::IO(error)) if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
 
         let name: super::Id = "file-one".parse()?;
         let file = dir
-            .create_file(Txn(1), name, Entry::Bin(vec![1u8, 2, 3]))
+            .create_file(Txn(1), name.clone(), Entry::Bin(vec![1u8, 2, 3]))
             .await?;
 
         let read = file.read::<Entry>(Txn(1)).await?;
@@ -208,19 +221,57 @@ mod tests {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[1u8, 2, 3]),
         }
 
-        {
-            let mut write = file.write::<Entry>(Txn(2)).await?;
-            *write = Entry::Bin(vec![9u8, 8]);
-        }
+        drop(read);
 
-        file.commit(Txn(2)).await?;
+        dir.commit(Txn(1)).await?;
+        assert!(dir.delete(Txn(2), name.clone()).await?);
+        dir.create_file(Txn(2), name.clone(), Entry::Bin(vec![9u8, 8]))
+            .await?;
+
+        dir.commit(Txn(2)).await?;
+        let rejected = dir.rollback(Txn(2)).await.unwrap_err();
+        assert_eq!(
+            std::error::Error::source(&rejected)
+                .and_then(|cause| cause.downcast_ref::<txn_lock::Error>()),
+            Some(&txn_lock::Error::Committed),
+        );
 
         let read = file.read::<Entry>(Txn(3)).await?;
         match &*read {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[9u8, 8]),
         }
 
-        let _ = fs::remove_dir_all(&path).await;
+        drop(read);
+        assert!(dir.delete(Txn(4), name.clone()).await?);
+        dir.create_file(Txn(4), name.clone(), Entry::Bin(vec![4]))
+            .await?;
+
+        let native = root;
+        let versions = native
+            .read()
+            .await
+            .get_dir(super::VERSIONS)
+            .unwrap()
+            .clone();
+
+        let versions = versions.read().await.get_dir("file-one").unwrap().clone();
+        assert!(versions.write().await.delete("4").await);
+        assert!(matches!(
+            file.read::<Entry>(Txn(4)).await,
+            Err(super::Error::Corrupt(_))
+        ));
+
+        dir.rollback(Txn(4)).await?;
+        assert!(
+            matches!(&*file.read::<Entry>(Txn(5)).await?, Entry::Bin(bytes) if bytes == &[9, 8])
+        );
+
+        drop(versions);
+        drop(native);
+        drop(file);
+        drop(dir);
+
+        fs::remove_dir_all(&path).await?;
 
         Ok(())
     }
@@ -236,44 +287,54 @@ mod tests {
 
         let cache = Cache::<Entry>::new(1024, None, 0, std::time::Duration::from_secs(3));
         let root = cache.load(path.clone())?;
-        let dir = super::Dir::<Txn, Entry>::load(root).await?;
+        let dir = super::Dir::<Txn, Entry>::load(root.clone()).await?;
+        let versions = root.read().await.get_dir(super::VERSIONS).unwrap().clone();
+        assert!(versions.read().await.is_empty());
         let name: super::Id = "file-one".parse()?;
         let entries = dir
             .iter(Txn(7))
             .await?
             .map(|(name, _)| (*name).clone())
             .collect::<Vec<_>>();
+
         assert_eq!(entries.as_slice(), std::slice::from_ref(&name));
         let file = dir
             .get_file(Txn(7), &name)
             .await?
             .expect("committed file")
             .clone();
+
         match &*file.read::<Entry>(Txn(7)).await? {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[4u8, 5, 6]),
         }
 
-        {
-            let mut pending = file.write::<Entry>(Txn(8)).await?;
-            *pending = Entry::Bin(vec![8]);
-        }
+        assert!(versions.read().await.is_empty());
+
+        assert!(dir.delete(Txn(8), name.clone()).await?);
+        dir.create_file(Txn(8), name.clone(), Entry::Bin(vec![8]))
+            .await?;
+
+        assert!(versions.read().await.contains(name.as_str()));
         match &*file.read::<Entry>(Txn(7)).await? {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[4u8, 5, 6]),
         }
+
         dir.rollback(Txn(8)).await?;
         dir.rollback(Txn(8)).await?;
 
-        {
-            let mut committed = file.write::<Entry>(Txn(9)).await?;
-            *committed = Entry::Bin(vec![9]);
-        }
+        assert!(dir.delete(Txn(9), name.clone()).await?);
+        dir.create_file(Txn(9), name.clone(), Entry::Bin(vec![9]))
+            .await?;
+
         dir.commit(Txn(9)).await?;
         dir.commit(Txn(9)).await?;
         match &*file.read::<Entry>(Txn(10)).await? {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[9]),
         }
+
         dir.finalize(Txn(9)).await?;
         dir.finalize(Txn(9)).await?;
+        assert!(versions.read().await.is_empty());
         match &*file.read::<Entry>(Txn(10)).await? {
             Entry::Bin(bytes) => assert_eq!(bytes.as_slice(), &[9]),
         }
@@ -292,11 +353,13 @@ mod tests {
             std::process::id(),
             unique
         ));
+
         let child_path = path.join("child");
         let pending = child_path
             .join(super::dir::VERSIONS)
             .join("file-one")
             .join("5");
+
         fs::create_dir_all(pending.parent().expect("pending parent")).await?;
         fs::write(&pending, [9u8]).await?;
 
@@ -308,11 +371,13 @@ mod tests {
             .await?
             .expect("child")
             .clone();
+
         // Only the recipient interprets this child's unresolved versions.
         assert!(matches!(
             super::Dir::<Txn, Entry>::load(child).await,
             Err(super::Error::Corrupt(_))
         ));
+
         assert_eq!(fs::read(&pending).await?, [9u8]);
 
         fs::remove_dir_all(path).await?;
@@ -325,6 +390,7 @@ mod tests {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path =
             std::env::temp_dir().join(format!("txfs_members_{}_{unique}", std::process::id()));
+
         fs::create_dir(&path).await?;
         let cache = Cache::<Entry>::new(4096, None, 0, std::time::Duration::from_secs(3));
         let root = cache.load(path.clone())?;
@@ -337,6 +403,7 @@ mod tests {
             .await
             .create_file("native".into(), Entry::Bin(vec![1, 2, 3]))
             .await?;
+
         file.sync_all().await?;
 
         // No parent lifecycle or loading operation may acquire this child's lock.
@@ -357,6 +424,7 @@ mod tests {
             })
             .await??;
         }
+
         assert!(!child.read().await.contains(super::VERSIONS));
         assert_eq!(fs::read(path.join("child/native")).await?, [1, 2, 3]);
         assert!(dir.get_dir(Txn(4), &name).await?.is_some());
@@ -375,6 +443,7 @@ mod tests {
             .await?
             .sync_all()
             .await?;
+
         dir.commit(Txn(5)).await?;
         dir.finalize(Txn(5)).await?;
         let reopened = super::Dir::<Txn, Entry>::load(root).await?;
@@ -387,26 +456,32 @@ mod tests {
     #[tokio::test]
     async fn historical_cleanup_does_not_recreate_a_deleted_subtree(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        for cleanup in ["file finalize", "directory finalize", "file rollback"] {
+        for cleanup in ["directory finalize", "directory rollback"] {
             let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let path = std::env::temp_dir().join(format!(
                 "txfs_retired_{}_{}",
                 std::process::id(),
                 unique
             ));
+
             fs::create_dir(&path).await?;
             let cache = Cache::<Entry>::new(4096, None, 0, std::time::Duration::from_secs(3));
             let parent = super::Dir::<Txn, Entry>::load(cache.load(path.clone())?).await?;
             let name: super::Id = "child".parse()?;
             let child = super::Dir::load(parent.create_dir(Txn(1), name.clone()).await?).await?;
-            let file = child
+            let _file = child
                 .create_file(Txn(1), "data".parse()?, Entry::Bin(vec![1]))
                 .await?;
+
             child.commit(Txn(1)).await?;
             parent.commit(Txn(1)).await?;
-            if cleanup == "file rollback" {
-                *file.write::<Entry>(Txn(2)).await? = Entry::Bin(vec![2]);
+            if cleanup == "directory rollback" {
+                assert!(child.delete(Txn(2), "data".parse()?).await?);
+                child
+                    .create_file(Txn(2), "data".parse()?, Entry::Bin(vec![2]))
+                    .await?;
             }
+
             assert!(parent.delete(Txn(3), name.clone()).await?);
             parent.commit(Txn(3)).await?;
             assert!(!path.join("child").exists());
@@ -414,22 +489,26 @@ mod tests {
             // Historical owners can still reach their cutoff after their parent
             // has committed deletion. Cleanup must not publish storage again.
             match cleanup {
-                "file finalize" => file.finalize(Txn(1)).await?,
                 "directory finalize" => child.finalize(Txn(1)).await?,
-                "file rollback" => file.rollback(Txn(2)).await?,
+                "directory rollback" => child.rollback(Txn(2)).await?,
                 _ => unreachable!(),
             }
+
             assert!(
                 !path.join("child").exists(),
                 "{cleanup} recreated its subtree"
             );
+
             let reopened_cache =
                 Cache::<Entry>::new(4096, None, 0, std::time::Duration::from_secs(3));
+
             let reopened =
                 super::Dir::<Txn, Entry>::load(reopened_cache.load(path.clone())?).await?;
+
             assert!(reopened.get_dir(Txn(4), &name).await?.is_none());
             fs::remove_dir_all(path).await?;
         }
+
         Ok(())
     }
 }
