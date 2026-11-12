@@ -1,19 +1,22 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::hash::Hash;
+use std::io;
+use std::ops::Deref;
 use std::str::FromStr;
-use std::{fmt, io};
 
 use freqfs::{DirLock, FileLoad, FileSave};
 use futures::future::TryFutureExt;
-use futures::stream::{self, FuturesUnordered, Stream, StreamExt};
+use futures::stream::{self, Stream, StreamExt};
 use get_size::GetSize;
 use hr_id::Id;
 use safecast::AsType;
 use txn_lock::map::{
-    Entry as TxnMapEntry, Iter, TxnMapLock, TxnMapValueReadGuard, TxnMapValueReadGuardMap,
+    Entry as TxnMapEntry, TxnMapLock, TxnMapLockIterGuard, TxnMapValueReadGuard,
+    TxnMapValueReadGuardMap,
 };
 
-use super::file::*;
+use super::file::{File, FileVersionRead};
 use super::{Error, Result};
 
 /// The name of an entry in a [`Dir`], used to avoid unnecessary allocations
@@ -42,11 +45,6 @@ impl<TxnId, FE> DirEntry<TxnId, FE> {
     pub fn is_dir(&self) -> bool {
         matches!(self, Self::Dir(_))
     }
-
-    /// Return `true` if this [`DirEntry`] is a [`File`].
-    fn is_file(&self) -> bool {
-        matches!(self, Self::File(_))
-    }
 }
 
 impl<TxnId, FE> fmt::Debug for DirEntry<TxnId, FE> {
@@ -58,14 +56,84 @@ impl<TxnId, FE> fmt::Debug for DirEntry<TxnId, FE> {
     }
 }
 
+// Membership and the stage naming each file's bytes share one history.
+// Read handles are projected from these records, never stored inside their owner.
+#[derive(Clone)]
+pub(super) enum Entry<TxnId, FE> {
+    Dir(DirLock<FE>),
+    File(Option<TxnId>),
+}
+
+impl<TxnId, FE> Entry<TxnId, FE> {
+    fn is_dir(&self) -> bool {
+        matches!(self, Self::Dir(_))
+    }
+
+    fn is_file(&self) -> bool {
+        matches!(self, Self::File(_))
+    }
+}
+
+impl<TxnId: fmt::Debug, FE> fmt::Debug for Entry<TxnId, FE> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Dir(dir) => dir.fmt(f),
+            Self::File(version) => f.debug_tuple("file version").field(version).finish(),
+        }
+    }
+}
+
+// An iterator item retains the original membership guard while exposing a read handle.
+struct EntryRead<TxnId, FE> {
+    entry: DirEntry<TxnId, FE>,
+    _version: TxnMapLockIterGuard<Id, Entry<TxnId, FE>>,
+}
+
+impl<TxnId, FE> Deref for EntryRead<TxnId, FE> {
+    type Target = DirEntry<TxnId, FE>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entry
+    }
+}
+
 /// Transactional membership and file versions in one directory.
 ///
 /// Child directories are native handles. Their recipients own loading and
 /// lifecycle delegation; this directory never versions or synchronizes their contents.
+///
+/// Retain a `File` handle freely, but release its read guard before a decision.
+/// Finish any child owners before deciding their parent. Errors or cancellation
+/// during publication require caller recovery; do not attempt an automatic rollback.
+///
+/// ```
+/// use txfs::{Dir, Id, Result};
+///
+/// async fn inspect_and_commit<T>(
+///     dir: &Dir<u64, T>,
+///     txn: u64,
+///     name: Id,
+///     inspect: impl FnOnce(&T),
+/// ) -> Result<()>
+/// where
+///     T: freqfs::FileLoad + freqfs::FileSave + get_size::GetSize + Clone + safecast::AsType<T>,
+/// {
+///     let file = dir.get_file(txn, &name).await?
+///         .ok_or_else(|| txfs::Error::NotFound(name.to_string()))?.clone();
+///
+///     {
+///         let value = file.read::<T>(txn).await?;
+///         inspect(&value);
+///     } // Both native access and pending membership are released here.
+///
+///     dir.commit(txn).await?;
+///     Ok(())
+/// }
+/// ```
 pub struct Dir<TxnId, FE> {
-    canon: DirLock<FE>,
-    versions: DirLock<FE>,
-    entries: TxnMapLock<TxnId, Id, DirEntry<TxnId, FE>>,
+    pub(super) canon: DirLock<FE>,
+    pub(super) versions: DirLock<FE>,
+    pub(super) entries: TxnMapLock<TxnId, Id, Entry<TxnId, FE>>,
 }
 
 impl<TxnId, FE> Clone for Dir<TxnId, FE> {
@@ -75,19 +143,6 @@ impl<TxnId, FE> Clone for Dir<TxnId, FE> {
             versions: self.versions.clone(),
             entries: self.entries.clone(),
         }
-    }
-}
-
-impl<TxnId, FE> Dir<TxnId, FE>
-where
-    FE: Send + Sync,
-{
-    /// Destructure this [`Dir`] into its underlying [`DirLock`].
-    /// The caller of this method must implement transactional state management explicitly.
-    /// Other clones retain this directory's transactional state; this does not revoke them.
-    pub fn into_inner(self) -> DirLock<FE> {
-        debug_assert!(self.canon.try_read().expect("canon").contains(VERSIONS));
-        self.canon
     }
 }
 
@@ -131,20 +186,19 @@ where
             let mut dir = canon.write().await;
             dir.get_or_create_dir(VERSIONS.to_string())?
         };
+
         let mut contents = HashMap::new();
         let canonical = canon
             .try_read()?
             .iter()
             .filter(|(name, _)| name.as_str() != VERSIONS)
             .map(|(name, entry)| (name.clone(), entry.clone()))
-            .collect::<Vec<_>>();
+            .collect::<BTreeMap<_, _>>();
 
         {
             let versions = versions.read().await;
             for (name, entry) in versions.iter() {
-                let canonical_file = canonical.iter().any(|(canonical, entry)| {
-                    canonical == name && matches!(entry, freqfs::DirEntry::File(_))
-                });
+                let canonical_file = matches!(canonical.get(name), Some(freqfs::DirEntry::File(_)));
                 match entry {
                     freqfs::DirEntry::Dir(dir) if canonical_file && dir.read().await.is_empty() => {
                     }
@@ -160,17 +214,10 @@ where
         for (name, entry) in canonical {
             let name: Id = name.parse()?;
             let entry = match entry {
-                freqfs::DirEntry::Dir(dir) => DirEntry::Dir(dir),
-                freqfs::DirEntry::File(_) => {
-                    let file_versions = {
-                        let mut versions = versions.write().await;
-                        versions.get_or_create_dir(name.to_string())?
-                    };
-                    File::load(name.clone(), canon.clone(), file_versions)
-                        .map_ok(DirEntry::File)
-                        .await?
-                }
+                freqfs::DirEntry::Dir(dir) => Entry::Dir(dir),
+                freqfs::DirEntry::File(_) => Entry::File(None),
             };
+
             contents.insert(name, entry);
         }
 
@@ -183,13 +230,21 @@ where
 
     /// Create a child directory with transactional membership at `txn_id`.
     /// Its recipient owns native contents, or explicitly loads another [`Dir`].
-    pub async fn create_dir(&self, txn_id: TxnId, name: Id) -> Result<DirLock<FE>> {
+    pub async fn create_dir(&self, txn_id: TxnId, name: Id) -> Result<DirLock<FE>>
+    where
+        TxnId: FromStr,
+    {
         #[cfg(feature = "logging")]
         log::trace!("Dir::create_dir {name}");
 
         if name.as_str() == VERSIONS {
-            return Err(Error::Corrupt(format!("reserved storage name {name}")));
+            return Err(Error::IO(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("reserved storage name {name}"),
+            )));
         }
+
+        stage_name(txn_id)?;
 
         let entry = match self.entries.entry(txn_id, name.clone()).await? {
             TxnMapEntry::Occupied(_) => {
@@ -202,13 +257,13 @@ where
             TxnMapEntry::Vacant(entry) => entry,
         };
 
-        let sub_dir = self
-            .canon
-            .write()
-            .await
-            .get_or_create_dir(name.to_string())?;
+        let _versions = self.versions.write().await;
+        // Reject obsolete membership before creating or reusing a native owner.
+        entry.get_committed()?;
+        let mut canon = self.canon.write().await;
+        let sub_dir = canon.get_or_create_dir(name.to_string())?;
 
-        entry.insert(DirEntry::Dir(sub_dir.clone()));
+        entry.insert(Entry::Dir(sub_dir.clone()))?;
 
         Ok(sub_dir)
     }
@@ -230,7 +285,12 @@ where
     /// Stage removal of the entry at `name`, returning whether it was present.
     /// Child contents remain intact until commit removes the physical subtree.
     /// Callers must release child operations before committing its deletion.
-    pub async fn delete(&self, txn_id: TxnId, name: Id) -> Result<bool> {
+    pub async fn delete(&self, txn_id: TxnId, name: Id) -> Result<bool>
+    where
+        TxnId: FromStr,
+    {
+        stage_name(txn_id)?;
+
         Ok(self.entries.remove(txn_id, &name).await?.is_some())
     }
 
@@ -255,7 +315,7 @@ where
         FE: FileLoad + AsType<F>,
         F: Send + Sync + 'static,
     {
-        let entries = self.entries.iter(txn_id).await?;
+        let entries = self.iter(txn_id).await?;
         let files = entries.filter_map(|(name, entry)| match &*entry {
             DirEntry::File(file) => Some((name, file.clone())),
             _ => None,
@@ -268,8 +328,31 @@ where
     }
 
     /// Construct an iterator over the contents of this [`Dir`] at `txn_id`.
-    pub async fn iter(&self, txn_id: TxnId) -> Result<Iter<TxnId, Id, DirEntry<TxnId, FE>>> {
-        self.entries.iter(txn_id).map_err(Error::from).await
+    pub async fn iter(
+        &self,
+        txn_id: TxnId,
+    ) -> Result<
+        impl Iterator<Item = (Key, impl Deref<Target = DirEntry<TxnId, FE>>)> + Send + 'static,
+    > {
+        let entries = self.entries.iter(txn_id).await?;
+        let directory = self.clone();
+        Ok(entries.map(move |(name, version)| {
+            let entry = match &*version {
+                Entry::Dir(dir) => DirEntry::Dir(dir.clone()),
+                Entry::File(_) => DirEntry::File(File {
+                    directory: directory.clone(),
+                    name: (*name).clone(),
+                }),
+            };
+
+            (
+                name,
+                EntryRead {
+                    entry,
+                    _version: version,
+                },
+            )
+        }))
     }
 
     /// Get a sub-directory in this [`Dir`] at the given `txn_id`.
@@ -278,11 +361,11 @@ where
         txn_id: TxnId,
         name: &Id,
     ) -> Result<Option<TxnMapValueReadGuardMap<Id, DirLock<FE>>>> {
-        if let Some(entry) = self.entries.get(txn_id, name).map_err(Error::from).await? {
-            expect_dir(entry).map(Some)
-        } else {
-            Ok(None)
-        }
+        self.entries
+            .get(txn_id, name)
+            .await?
+            .map(|entry| project_dir(entry, name))
+            .transpose()
     }
 
     /// Get a sub-directory in this [`Dir`] at the given `txn_id` synchronously, if possible.
@@ -291,15 +374,18 @@ where
         txn_id: TxnId,
         name: &Id,
     ) -> Result<Option<TxnMapValueReadGuardMap<Id, DirLock<FE>>>> {
-        if let Some(entry) = self.entries.try_get(txn_id, name).map_err(Error::from)? {
-            expect_dir(entry).map(Some)
-        } else {
-            Ok(None)
-        }
+        self.entries
+            .try_get(txn_id, name)?
+            .map(|entry| project_dir(entry, name))
+            .transpose()
     }
 
     /// Stage removal of all entries, without changing child transaction state.
-    pub async fn truncate(self, txn_id: TxnId) -> Result<()> {
+    pub async fn truncate(&self, txn_id: TxnId) -> Result<()>
+    where
+        TxnId: FromStr,
+    {
+        stage_name(txn_id)?;
         self.entries.clear(txn_id).await?;
         Ok(())
     }
@@ -320,13 +406,19 @@ where
     where
         FE: FileLoad + AsType<F>,
         F: GetSize + Clone,
+        TxnId: FromStr,
     {
         #[cfg(feature = "logging")]
         log::trace!("Dir::create_file {name}");
 
         if name.as_str() == VERSIONS {
-            return Err(Error::Corrupt(format!("reserved storage name {name}")));
+            return Err(Error::IO(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("reserved storage name {name}"),
+            )));
         }
+
+        let txn_name = stage_name(txn_id)?;
 
         // this write permit ensures that there is no other pending entry with this name
         let entry = match self.entries.entry(txn_id, name.clone()).await? {
@@ -340,14 +432,30 @@ where
             TxnMapEntry::Vacant(entry) => entry,
         };
 
-        let versions = {
-            let mut versions = self.versions.write().await;
-            versions.get_or_create_dir(name.to_string())?
+        // Keep native creation and membership publication indivisible to cleanup.
+        let mut versions_root = self.versions.write().await;
+        let prior = entry.get_committed()?;
+        if matches!(prior.as_deref(), Some(Entry::Dir(_)))
+            || self.canon.read().await.get_dir(name.as_str()).is_some()
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::AlreadyExists, format!("directory {name}")).into(),
+            );
+        }
+
+        let versions = versions_root.get_or_create_dir(name.to_string())?;
+        let mut versions = versions.write().await;
+        // Same-transaction replacement changes only its own stage.
+        if versions.get_file(&txn_name).is_some() {
+            versions.delete(&txn_name).await;
+        }
+
+        versions.create_file(txn_name, contents).await?;
+        entry.insert(Entry::File(Some(txn_id)))?;
+        let file = File {
+            directory: self.clone(),
+            name,
         };
-
-        let file = File::create(txn_id, name, self.canon.clone(), versions, contents).await?;
-
-        entry.insert(DirEntry::File(file.clone()));
 
         Ok(file)
     }
@@ -358,11 +466,11 @@ where
         txn_id: TxnId,
         name: &Id,
     ) -> Result<Option<TxnMapValueReadGuardMap<Id, File<TxnId, FE>>>> {
-        if let Some(entry) = self.entries.get(txn_id, name).map_err(Error::from).await? {
-            expect_file(entry).map(Some)
-        } else {
-            Ok(None)
-        }
+        self.entries
+            .get(txn_id, name)
+            .await?
+            .map(|entry| project_file(entry, self, name))
+            .transpose()
     }
 
     /// Get a [`File`] present in this [`Dir`] at the given `txn_id` synchronously, if possible.
@@ -371,11 +479,10 @@ where
         txn_id: TxnId,
         name: &Id,
     ) -> Result<Option<TxnMapValueReadGuardMap<Id, File<TxnId, FE>>>> {
-        if let Some(entry) = self.entries.try_get(txn_id, name).map_err(Error::from)? {
-            expect_file(entry).map(Some)
-        } else {
-            Ok(None)
-        }
+        self.entries
+            .try_get(txn_id, name)?
+            .map(|entry| project_file(entry, self, name))
+            .transpose()
     }
 
     /// Convenience method to lock a file in this [`Dir`] for reading at the given `txn_id`.
@@ -389,29 +496,93 @@ where
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F>,
     {
-        if let Some(file) = self.get_file(txn_id, name).await? {
-            file.read(txn_id).await
-        } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, format!("file not found: {name}")).into())
-        }
+        self.read_version(txn_id, name).await
     }
+}
 
-    /// Convenience method to lock a file in this [`Dir`] for writing at the given `txn_id`.
-    /// This returns an owned write guard or an error if the file is not found.
-    pub async fn write_file<F>(
+impl<TxnId, FE> Dir<TxnId, FE>
+where
+    TxnId: fmt::Display + fmt::Debug + Hash + Ord + Copy,
+    FE: Send + Sync,
+{
+    pub(super) async fn read_version<F>(
         &self,
         txn_id: TxnId,
         name: &Id,
-    ) -> Result<FileVersionWrite<TxnId, FE, F>>
+    ) -> Result<FileVersionRead<TxnId, FE, F>>
     where
-        F: Send + Sync + 'static + GetSize + Clone,
-        FE: FileLoad + FileSave + AsType<F>,
+        F: Send + Sync + 'static,
+        FE: FileLoad + AsType<F>,
     {
-        if let Some(file) = self.get_file(txn_id, name).await? {
-            file.write(txn_id).await
+        let entry = self
+            .entries
+            .get(txn_id, name)
+            .await?
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+
+        let Entry::File(modified) = &*entry else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("not a file: {}", name),
+            )
+            .into());
+        };
+
+        // The directory excludes publication and cleanup until the native read
+        // guard is acquired. The sole history decides both membership and bytes.
+        let versions = self.versions.read().await;
+        let staged = if let Some(modified) = modified {
+            let file_versions = versions.get_dir(name.as_str());
+            if let Some(file_versions) = file_versions {
+                file_versions
+                    .read()
+                    .await
+                    .get_file(&modified.to_string())
+                    .cloned()
+            } else {
+                None
+            }
         } else {
-            Err(io::Error::new(io::ErrorKind::NotFound, format!("file not found: {name}")).into())
-        }
+            None
+        };
+
+        let version = if let Some(staged) = staged {
+            staged.into_read().await?
+        } else {
+            let parent = self.canon.read().await;
+            let (baseline, latest) = self.entries.inspect_committed(
+                txn_id,
+                name,
+                |base, latest, _| {
+                    let matches = |entry: Option<&Entry<TxnId, FE>>| matches!(entry, Some(Entry::File(id)) if id == modified);
+
+                    (matches(base), matches(latest))
+                },
+            )?;
+
+            if !baseline {
+                return Err(Error::Corrupt(format!(
+                    "missing retained version for {} at {modified:?}",
+                    name
+                )));
+            }
+
+            if !latest {
+                return Err(txn_lock::Error::Outdated.into());
+            }
+
+            let version = parent
+                .get_file(name.as_str())
+                .cloned()
+                .ok_or_else(|| Error::Corrupt(format!("missing canonical version for {}", name)))?;
+
+            version.into_read().await?
+        };
+
+        Ok(FileVersionRead {
+            version,
+            _entry: entry,
+        })
     }
 }
 
@@ -426,22 +597,79 @@ where
         #[cfg(feature = "logging")]
         log::trace!("Dir::commit");
 
-        let (contents, deltas) = self.entries.read_and_commit(txn_id).await;
-
-        let mut commits = FuturesUnordered::new();
-
-        for entry in contents.values() {
-            #[cfg(feature = "logging")]
-            log::trace!("Dir::commit: {:?}", entry);
-
-            if let DirEntry::File(file) = &**entry {
-                commits.push(file.commit(txn_id));
-            }
+        // Completed decisions need neither a membership snapshot nor new admission.
+        if self.entries.is_committed(txn_id)? {
+            return Ok(());
         }
 
-        while let Some(result) = commits.next().await {
+        let txn_name = stage_name(txn_id)?;
+        let txn_name = txn_name.as_str();
+
+        // Admission resolves causal predecessors before native publication exclusion.
+        let mut files = self.entries.iter(txn_id).await?;
+        self.entries.check_commit(txn_id)?;
+        if self.entries.is_committed(txn_id)? {
+            return Ok(());
+        }
+
+        let versions = self.versions.write().await;
+        // A concurrent identical decision may have finished while we waited.
+        self.entries.check_commit(txn_id)?;
+        if self.entries.is_committed(txn_id)? {
+            return Ok(());
+        }
+
+        let limit = self.canon.read().await.max_file_handles();
+        let mut publications = stream::iter(std::iter::from_fn(move || loop {
+            let (name, entry) = files.next()?;
+            if matches!(&*entry, Entry::File(Some(id)) if *id == txn_id) {
+                // Native work retains names, not guards on pending membership.
+                return Some(name);
+            }
+        }))
+        .map(|name| {
+            let versions = &versions;
+            async move {
+                #[cfg(test)]
+                crate::lifecycle_tests::entered().await?;
+
+                let staged = {
+                    let dir = versions.get_dir(name.as_str()).ok_or_else(|| {
+                        Error::Corrupt(format!("missing staged versions for {name}"))
+                    })?;
+
+                    dir.read()
+                        .await
+                        .get_file(txn_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::Corrupt(format!("missing staged version {txn_id:?} for {name}"))
+                        })?
+                };
+
+                let file = {
+                    let mut canon = self.canon.write().await;
+                    canon.copy_file_from(name.to_string(), &staged).await?
+                };
+
+                file.sync_all().await?;
+                #[cfg(test)]
+                crate::lifecycle_tests::published().await?;
+
+                Ok::<_, Error>(())
+            }
+        })
+        .buffer_unordered(limit);
+
+        while let Some(result) = publications.next().await {
             result?;
         }
+
+        drop(publications);
+
+        // All bytes are durable before their single logical decision. Revalidate
+        // without waiting, retaining exclusion through deletions and their sync.
+        let (contents, deltas) = self.entries.try_read_and_commit(txn_id)?;
 
         // New directory entries need durable publication as well as deletions.
         let needs_sync = deltas.as_ref().is_some_and(|deltas| !deltas.is_empty());
@@ -452,7 +680,7 @@ where
                 if entry.is_none() {
                     assert!(!contents.contains_key(&*name));
 
-                    canon.delete(&*name).await;
+                    canon.delete(name.as_str()).await;
                 }
             }
         };
@@ -461,102 +689,218 @@ where
             // Publish membership changes and finish deletions before same-name reuse.
             self.canon.sync_deleted().await?;
         }
+
         Ok(())
     }
 
     /// Roll back immediate file versions and membership at `txn_id`.
+    /// Reclaim unused workspaces and cleaned children without advancing the cutoff.
+    /// Nonempty, unprotected children return `DirectoryNotEmpty`; their recipient
+    /// must finish cleanup. Logical rollback may already have completed on error.
     pub async fn rollback(&self, txn_id: TxnId) -> Result<()> {
-        let (contents, _deltas) = self.entries.read_and_rollback(txn_id).await;
+        let txn_name = stage_name(txn_id)?;
+        let txn_name = txn_name.as_str();
 
-        let mut rollbacks = FuturesUnordered::new();
+        // Wait for causal membership before excluding publication and cleanup.
+        let admission = self.entries.iter(txn_id).await?;
+        self.entries.check_commit(txn_id)?;
+        let mut versions = self.versions.write().await;
+        self.entries.check_commit(txn_id)?;
+        self.entries.rollback(&txn_id)?;
+        drop(admission);
 
-        for entry in contents.values() {
-            if let DirEntry::File(file) = &**entry {
-                rollbacks.push(file.rollback(txn_id));
+        let mut protected = HashSet::new();
+        self.entries.inspect_versions(txn_id, |_, name, _| {
+            protected.insert(name.clone());
+        })?;
+
+        // Includes stages whose names disappeared from pending membership.
+        let limit = self.canon.read().await.max_file_handles();
+        let mut entries = versions.iter();
+        let entries = std::iter::from_fn(move || {
+            let (name, entry) = entries.next()?;
+            Some((name.clone(), entry.clone()))
+        });
+
+        let mut cleanup = stream::iter(entries)
+            .map(|(name, entry)| async move {
+                let freqfs::DirEntry::Dir(dir) = entry else {
+                    return Err(Error::Corrupt(
+                        "invalid transactional version directory".into(),
+                    ));
+                };
+
+                #[cfg(test)]
+                crate::lifecycle_tests::entered().await?;
+
+                let mut dir = dir.write().await;
+                match dir.get(txn_name) {
+                    Some(freqfs::DirEntry::File(_)) => {
+                        dir.delete(txn_name).await;
+                        sync_cleanup(&mut dir).await?;
+                    }
+                    Some(freqfs::DirEntry::Dir(_)) => {
+                        return Err(Error::Corrupt("invalid transaction stage".into()));
+                    }
+                    None => {}
+                }
+
+                Ok(dir.is_empty().then_some(name))
+            })
+            .buffer_unordered(limit);
+
+        let mut remove_versions = Vec::new();
+        while let Some(result) = cleanup.next().await {
+            if let Some(name) = result? {
+                remove_versions.push(name);
             }
         }
 
-        while let Some(result) = rollbacks.next().await {
-            result?;
+        drop(cleanup);
+        for name in remove_versions {
+            versions.delete(&name).await;
         }
+
+        // Deleted historical owners may finish cleanup after parent removal.
+        sync_cleanup(&mut versions).await?;
+
+        let mut canon = self.canon.write().await;
+        let mut remove_dirs = Vec::new();
+        for (name, entry) in canon.iter() {
+            if name == VERSIONS || protected.contains(name.as_str()) {
+                continue;
+            }
+
+            if let freqfs::DirEntry::Dir(dir) = entry {
+                if !cleaned_child(dir).await? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::DirectoryNotEmpty,
+                        format!("recipient must clean rolled-back directory {name}"),
+                    )
+                    .into());
+                }
+
+                remove_dirs.push(name.clone());
+            }
+        }
+
+        for name in &remove_dirs {
+            canon.delete(name).await;
+        }
+
+        // A prior failed or cancelled pass may have left deletion obligations.
+        sync_cleanup(&mut canon).await?;
+
         Ok(())
     }
 
     /// Finalize immediate file versions and membership through `txn_id`.
     /// This does not finalize or synchronize surviving child directories.
     pub async fn finalize(&self, txn_id: TxnId) -> Result<()> {
-        let mut sync_canon = false;
+        stage_name(txn_id)?;
 
-        if let Some(entries) = self.entries.read_and_finalize(txn_id) {
-            {
-                let mut finalizes = FuturesUnordered::new();
-                for entry in entries.values() {
-                    if let DirEntry::File(file) = &**entry {
-                        finalizes.push(file.finalize(txn_id));
-                    }
-                }
-                while let Some(result) = finalizes.next().await {
-                    result?;
-                }
+        // Native publication and cleanup share these guards, in this order.
+        // No transaction bookkeeping guard is retained across storage work.
+        let mut versions = self.versions.write().await;
+        let mut canon = self.canon.write().await;
+        let mut protected = HashSet::new();
+        let inspected = self.entries.inspect_versions(txn_id, |id, name, _| {
+            if id.is_some_and(|id| id > txn_id) {
+                protected.insert(name.clone());
             }
-            let names = entries
-                .into_keys()
-                .map(|name| name.to_string())
-                .collect::<HashSet<_>>();
+        });
 
-            {
-                let mut versions = self.versions.write().await;
-                let mut to_delete = Vec::with_capacity(versions.len());
+        match inspected {
+            Err(txn_lock::Error::Outdated) => return Ok(()),
+            result => result?,
+        }
 
-                for (name, entry) in versions.iter() {
-                    if names.contains(name) {
-                        continue;
+        let Some(entries) = self.entries.read_and_finalize(txn_id)? else {
+            return Ok(());
+        };
+
+        protected.extend(entries.keys().map(|name| (**name).clone()));
+
+        // Removed owners and create-then-delete files may have orphan stages.
+        // Only the cutoff's stages are reclaimable, regardless of current names.
+        let mut remove_versions = Vec::new();
+        let mut dirs = versions.iter();
+        let dirs = std::iter::from_fn(move || {
+            let (name, entry) = dirs.next()?;
+            Some((name.clone(), entry.clone()))
+        });
+
+        let mut cleanup = stream::iter(dirs)
+            .map(|(name, entry)| async move {
+                let freqfs::DirEntry::Dir(dir) = entry else {
+                    return Err(Error::Corrupt(
+                        "invalid transactional version directory".into(),
+                    ));
+                };
+
+                #[cfg(test)]
+                crate::lifecycle_tests::entered().await?;
+
+                let mut dir = dir.write().await;
+                let mut stages = Vec::new();
+                for (stage, entry) in dir.iter() {
+                    let id = stage.parse::<TxnId>().map_err(|_| {
+                        Error::Corrupt(format!("invalid staged transaction version {stage}"))
+                    })?;
+
+                    if !matches!(entry, freqfs::DirEntry::File(_)) {
+                        return Err(Error::Corrupt("invalid transaction stage".into()));
                     }
 
-                    // this assumes that a file's version directory will only be empty
-                    // after the last file version has been finalized
-                    // and before any new version has been created
-                    if let freqfs::DirEntry::Dir(dir) = entry {
-                        let dir = dir.read().await;
-                        if dir.is_empty() {
-                            to_delete.push(name.to_string());
-                        }
+                    if id <= txn_id {
+                        stages.push(stage.clone());
                     }
                 }
 
-                for name in to_delete {
-                    versions.delete(name.as_str()).await;
+                for stage in stages {
+                    dir.delete(&stage).await;
                 }
 
-                versions.sync_deleted().await?;
-            }
+                sync_cleanup(&mut dir).await?;
 
-            let mut canon = self.canon.write().await;
-            let mut to_delete = Vec::with_capacity(canon.len());
+                Ok(dir.is_empty().then_some(name))
+            })
+            .buffer_unordered(canon.max_file_handles());
 
-            for (name, entry) in canon.iter() {
-                if names.contains(name) || name == VERSIONS {
-                    continue;
-                }
-
-                // this assumes that a directory will be empty after all its files are deleted
-                if let freqfs::DirEntry::Dir(dir) = entry {
-                    let dir = dir.read().await;
-                    if dir.is_empty() {
-                        to_delete.push(name.clone());
-                        sync_canon = true;
-                    }
-                }
-            }
-
-            for name in to_delete {
-                canon.delete(&name).await;
+        while let Some(result) = cleanup.next().await {
+            if let Some(name) = result? {
+                remove_versions.push(name);
             }
         }
 
-        if sync_canon {
-            self.canon.sync_deleted().await?;
+        drop(cleanup);
+        for name in remove_versions {
+            versions.delete(&name).await;
         }
+
+        // Historical owners may finish cleanup after parent removal.
+        sync_cleanup(&mut versions).await?;
+
+        let mut remove_dirs = Vec::new();
+        for (name, entry) in canon.iter() {
+            if name == VERSIONS || protected.contains(name.as_str()) {
+                continue;
+            }
+
+            if let freqfs::DirEntry::Dir(dir) = entry {
+                if cleaned_child(dir).await? {
+                    remove_dirs.push(name.clone());
+                }
+            }
+        }
+
+        for name in &remove_dirs {
+            canon.delete(name).await;
+        }
+
+        // A prior failed or cancelled pass may have left deletion obligations.
+        sync_cleanup(&mut canon).await?;
+
         Ok(())
     }
 }
@@ -567,28 +911,74 @@ impl<TxnId, FE> fmt::Debug for Dir<TxnId, FE> {
     }
 }
 
-#[inline]
-fn expect_dir<TxnId, FE>(
-    entry: TxnMapValueReadGuard<Id, DirEntry<TxnId, FE>>,
+// Parent cleanup owns only empty children or completed child metadata.
+async fn cleaned_child<FE: Send + Sync>(dir: &DirLock<FE>) -> Result<bool> {
+    let dir = dir.read().await;
+    if dir.is_empty() {
+        return Ok(true);
+    }
+
+    match dir.get(VERSIONS) {
+        Some(freqfs::DirEntry::File(_)) => Err(Error::Corrupt(
+            "invalid transactional version directory".into(),
+        )),
+        Some(freqfs::DirEntry::Dir(metadata)) if dir.len() == 1 => {
+            Ok(metadata.read().await.is_empty())
+        }
+        _ => Ok(false),
+    }
+}
+
+// Stage names are an encoding of transaction identity, not a lossy label.
+fn stage_name<I: Copy + Eq + fmt::Display + FromStr>(id: I) -> Result<String> {
+    let name = id.to_string();
+    freqfs::validate_name(&name)?;
+    if name.parse::<I>().ok() != Some(id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "transaction ID must round-trip through Display and FromStr",
+        )
+        .into());
+    }
+
+    Ok(name)
+}
+
+fn project_dir<I, FE>(
+    entry: TxnMapValueReadGuard<Id, Entry<I, FE>>,
+    name: &Id,
 ) -> Result<TxnMapValueReadGuardMap<Id, DirLock<FE>>> {
     entry.try_map(|entry| match entry {
-        DirEntry::Dir(dir) => Ok(dir.clone()),
-        DirEntry::File(file) => Err(io::Error::new(
+        Entry::Dir(dir) => Ok(dir.clone()),
+        Entry::File(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("not a directory: {:?}", file),
+            format!("not a directory: {name}"),
         )
         .into()),
     })
 }
 
-#[inline]
-fn expect_file<TxnId, FE>(
-    entry: TxnMapValueReadGuard<Id, DirEntry<TxnId, FE>>,
-) -> Result<TxnMapValueReadGuardMap<Id, File<TxnId, FE>>> {
+fn project_file<I, FE>(
+    entry: TxnMapValueReadGuard<Id, Entry<I, FE>>,
+    directory: &Dir<I, FE>,
+    name: &Id,
+) -> Result<TxnMapValueReadGuardMap<Id, File<I, FE>>> {
     entry.try_map(|entry| match entry {
-        DirEntry::Dir(dir) => {
-            Err(io::Error::new(io::ErrorKind::InvalidData, format!("not a file: {:?}", dir)).into())
+        Entry::File(_) => Ok(File {
+            directory: directory.clone(),
+            name: name.clone(),
+        }),
+        Entry::Dir(dir) => {
+            Err(io::Error::new(io::ErrorKind::InvalidData, format!("not a file: {dir:?}")).into())
         }
-        DirEntry::File(file) => Ok(file.clone()),
     })
+}
+
+// Historical owners may finish deletion cleanup after their parent removed them.
+async fn sync_cleanup<FE: FileSave>(dir: &mut freqfs::Dir<FE>) -> Result<()> {
+    match dir.sync_deleted().await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
