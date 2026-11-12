@@ -35,6 +35,30 @@ Handing a native root to `Dir::load` is exclusive: stop using retained mutable
 native aliases and do not reopen the storage independently. Read handles retain
 access to the directory history; they do not revoke preexisting native aliases.
 
+## Transaction IDs and guard lifetimes
+
+Transaction IDs use their `Display` text as stage filenames. Custom implementations
+must produce stable, filename-safe names that uniquely identify transactions on
+the storage filesystem. `FromStr` must reconstruct the exact original value.
+Mutations and lifecycle cleanup validate this round trip and delegate filename
+validation to `freqfs`; invalid IDs return `Error::IO(InvalidInput)` before native
+effects or mutation reservations. Completed commits retain their fast return.
+Creation, deletion, and truncation now require `TxnId: FromStr`, as lifecycle
+methods already do. Read APIs keep their existing bounds. Valid stage names and
+storage encodings are unchanged.
+
+A cloned `File` is a reusable name-based read handle. A `FileVersionRead` pins
+native contents and can retain pending transaction membership. Release read guards
+and entry iterators before mutation or lifecycle calls. The `Dir` API example
+shows a scoped read followed by a decision. `truncate` borrows `&self`, like other
+directory mutations; cloning the directory to truncate it is unnecessary.
+
+Finish delegated child owners before deciding their parent. Native aliases retained
+before `Dir::load` must stop mutating that root. After failed or cancelled publication,
+release the interrupted owner and use the enclosing owner's recovery process;
+blindly retrying or rolling back cannot undo already published bytes. Successful
+local publication is not a substitute for application crash recovery.
+
 ## Decisions and cleanup
 
 Callers finish transaction operations before applying lifecycle decisions and
@@ -88,6 +112,32 @@ map iterator. Retained entries still protect pending membership. `get_file`,
 `read_file`, and `FileVersionRead` retain their owned read interfaces. Missing
 files consistently return `Error::NotFound` through either a file handle or
 `Dir::read_file`; native I/O errors retain their original causes.
+
+File-handle reads and directory convenience reads share one directory-owned
+version resolver. Entry projection is shared between asynchronous and synchronous
+getters. Cleanup synchronization shares the historical-owner missing-directory
+policy; stage selection and transaction decisions remain specific to each lifecycle.
+
+## Contention and directory size
+
+History is owned per directory; separately loaded child directories have independent
+histories. Readers share version-root access while acquiring their native guards.
+Returned read guards retain file contents and transaction capabilities, releasing
+the directory locks when acquisition completes.
+
+Staging, publication, and cleanup hold version-root exclusion. Fresh reads of
+unchanged files in that directory can wait behind durable synchronization or
+byte-capacity admission. Retained guards remain usable; callers should release
+unused guards so pinned cache memory does not prolong admission waits. Cancelling
+an operation releases its locks, with interrupted mutations still requiring caller
+cleanup/recovery.
+
+First commits construct a directory keyset and scan visible membership even for
+small changes. Cleanup scans retained history and workspaces and synchronizes
+native deletion obligations. Their costs depend on directory size and retained
+history. Completed commits return before acquiring another snapshot or causal
+admission; they do not republish bytes. Existing configured cache/admission bounds
+and caller-controlled finalization remain relevant to latency.
 
 ## Filesystem codecs and validation
 

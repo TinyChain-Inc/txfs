@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use freqfs::{Cache, FileLoad, FileSave};
-use futures::poll;
+use futures::{poll, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
@@ -133,7 +133,7 @@ async fn busy_directory_commit_does_not_publish_file_work() -> Result<()> {
     assert!(!root.read().await.contains(name.as_str()));
     assert_eq!(file.read::<Data>(1).await?.0, vec![1]);
     drop(guard);
-    let read = file.read::<Data>(1).await?;
+    let read = dir.read_file::<Data>(1, &name).await?;
     assert!(matches!(
         dir.commit(1).await,
         Err(crate::Error::Conflict(txn_lock::Error::Busy))
@@ -654,7 +654,7 @@ async fn rollback_cleans_removed_and_replaced_file_owners() -> Result<()> {
             dir.create_file(2, "value".parse()?, Data(vec![2])).await?;
 
             if operation == "truncate" {
-                dir.clone().truncate(2).await?;
+                dir.truncate(2).await?;
             } else {
                 assert!(dir.delete(2, name.clone()).await?);
                 if operation == "replace" {
@@ -1370,6 +1370,29 @@ async fn missing_file_reads_share_the_same_error_variant() -> Result<()> {
     let dir = Dir::<u64, Data>::load(root).await?;
     let name: crate::Id = "value".parse()?;
     let file = dir.create_file(1, name.clone(), Data(vec![1])).await?;
+    let folder: crate::Id = "folder".parse()?;
+    dir.create_dir(1, folder.clone()).await?;
+    assert!(dir.get_dir(1, &folder).await?.is_some());
+    assert!(dir.try_get_dir(1, &folder)?.is_some());
+    assert!(dir.get_file(1, &name).await?.is_some());
+    assert!(dir.try_get_file(1, &name)?.is_some());
+    for error in [
+        dir.get_dir(1, &name).await.err().unwrap(),
+        dir.try_get_dir(1, &name).err().unwrap(),
+        dir.get_file(1, &folder).await.err().unwrap(),
+        dir.try_get_file(1, &folder).err().unwrap(),
+        dir.read_file::<Data>(1, &folder).await.err().unwrap(),
+    ] {
+        assert!(
+            matches!(error, crate::Error::IO(ref error) if error.kind() == io::ErrorKind::InvalidData)
+        );
+    }
+
+    let missing = "missing".parse()?;
+    assert!(dir.get_dir(1, &missing).await?.is_none());
+    assert!(dir.try_get_dir(1, &missing)?.is_none());
+    assert!(dir.get_file(1, &missing).await?.is_none());
+    assert!(dir.try_get_file(1, &missing)?.is_none());
     dir.commit(1).await?;
     assert!(dir.delete(2, name.clone()).await?);
     dir.commit(2).await?;
@@ -1391,7 +1414,14 @@ async fn durable_publications_overlap_without_retaining_canonical_exclusion() ->
         let root = Cache::<Data>::new(1024 * 1024, Some(limit), 0, Duration::from_secs(3))
             .load(path.0.clone())?;
 
+        root.write()
+            .await
+            .create_file("stable".into(), Data(vec![9]))
+            .await?;
+
         let dir = Dir::<u64, Data>::load(root.clone()).await?;
+        let stable: crate::Id = "stable".parse()?;
+        let retained = dir.read_file::<Data>(0, &stable).await?;
         let first = dir.create_file(1, "file-0".parse()?, Data(vec![0])).await?;
         for i in 1..3 {
             dir.create_file(1, format!("file-{i}").parse()?, Data(vec![i]))
@@ -1425,6 +1455,12 @@ async fn durable_publications_overlap_without_retaining_canonical_exclusion() ->
             assert!(poll!(&mut read).is_pending());
         }
 
+        {
+            let mut unrelated = std::pin::pin!(dir.read_file::<Data>(1, &stable));
+            assert!(poll!(&mut unrelated).is_pending());
+            assert_eq!(retained.0, [9]);
+        }
+
         observer.released.store(true, Ordering::SeqCst);
         observer.release.notify_waiters();
         tokio::time::timeout(Duration::from_secs(3), commit)
@@ -1433,6 +1469,7 @@ async fn durable_publications_overlap_without_retaining_canonical_exclusion() ->
 
         drop(installed);
         assert!(dir.entries.is_committed(1)?);
+        assert_eq!(dir.read_file::<Data>(1, &stable).await?.0, [9]);
         assert_eq!(observer.started.load(Ordering::SeqCst), 3);
         assert_eq!(observer.peak.load(Ordering::SeqCst), limit);
         assert_eq!(observer.active.load(Ordering::SeqCst), 0);
@@ -1507,3 +1544,301 @@ async fn cleanup_retries_pending_native_removals_without_new_entries() -> Result
 
     Ok(())
 }
+
+#[tokio::test]
+async fn repeated_commits_skip_new_causal_admission() -> Result<()> {
+    let path = TestDir::new()?;
+    let root = Cache::<Data>::new(4096, Some(1), 0, Duration::from_secs(3)).load(path.0.clone())?;
+
+    let dir = Dir::<u64, Data>::load(root).await?;
+    let file = dir
+        .create_file(2, "committed".parse()?, Data(vec![2]))
+        .await?;
+
+    dir.commit(2).await?;
+    dir.create_file(1, "older-pending".parse()?, Data(vec![1]))
+        .await?;
+
+    let mut duplicate = std::pin::pin!(dir.commit(2));
+    assert!(matches!(
+        poll!(&mut duplicate),
+        std::task::Poll::Ready(Ok(()))
+    ));
+
+    assert_eq!(file.read::<Data>(2).await?.0, [2]);
+    dir.rollback(1).await?;
+    dir.finalize(2).await?;
+    assert!(matches!(
+        dir.commit(1).await,
+        Err(crate::Error::Conflict(txn_lock::Error::Outdated))
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cache_capacity_waits_release_publication_exclusion_on_cancellation() -> Result<()> {
+    let path = TestDir::new()?;
+    let root = Cache::<Data>::new(64, Some(1), 0, Duration::from_secs(3)).load(path.0.clone())?;
+
+    root.write()
+        .await
+        .create_file("pinned".into(), Data(vec![1; 64]))
+        .await?;
+
+    let dir = Dir::<u64, Data>::load(root).await?;
+    let name: crate::Id = "pinned".parse()?;
+    let pinned = dir.read_file::<Data>(1, &name).await?;
+    {
+        let mut creation = std::pin::pin!(dir.create_file(2, "new".parse()?, Data(vec![2; 64])));
+        assert!(poll!(&mut creation).is_pending());
+        let mut read = std::pin::pin!(dir.read_file::<Data>(1, &name));
+        assert!(poll!(&mut read).is_pending());
+        assert_eq!(pinned.0, [1; 64]);
+    }
+
+    let read = tokio::time::timeout(
+        Duration::from_secs(3),
+        dir.read_file::<Data>(1, &"pinned".parse()?),
+    )
+    .await
+    .unwrap()?;
+
+    assert_eq!(read.0, [1; 64]);
+    drop(read);
+    drop(pinned);
+    dir.rollback(2).await?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct TextId(u64);
+
+impl std::fmt::Display for TextId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            1 => f.write_str("0"),
+            2 => f.write_str("bad"),
+            3 => f.write_str("3/stage"),
+            4 => f.write_str("4._freqfs"),
+            value => value.fmt(f),
+        }
+    }
+}
+
+impl std::str::FromStr for TextId {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        text.strip_suffix("/stage")
+            .or_else(|| text.strip_suffix("._freqfs"))
+            .unwrap_or(text)
+            .parse()
+            .map(Self)
+    }
+}
+
+#[tokio::test]
+async fn transaction_names_reject_invalid_and_colliding_ids_before_effects() -> Result<()> {
+    let path = TestDir::new()?;
+    let root = Cache::<Data>::new(4096, Some(1), 0, Duration::from_secs(3)).load(path.0.clone())?;
+
+    let dir = Dir::<TextId, Data>::load(root.clone()).await?;
+    dir.create_file(TextId(0), "original".parse()?, Data(vec![7]))
+        .await?;
+
+    dir.commit(TextId(0)).await?;
+    let versions = root.read().await.get_dir(crate::VERSIONS).unwrap().clone();
+    for invalid in 1..=4 {
+        let id = TextId(invalid);
+        let errors = [
+            dir.create_file(id, "new".parse()?, Data(vec![8]))
+                .await
+                .err()
+                .unwrap(),
+            dir.create_dir(id, "child".parse()?).await.err().unwrap(),
+            dir.delete(id, "original".parse()?).await.unwrap_err(),
+            dir.truncate(id).await.unwrap_err(),
+            dir.commit(id).await.unwrap_err(),
+            dir.rollback(id).await.unwrap_err(),
+            dir.finalize(id).await.unwrap_err(),
+        ];
+
+        for error in errors {
+            assert!(
+                matches!(error, crate::Error::IO(ref cause) if cause.kind() == io::ErrorKind::InvalidInput)
+            );
+        }
+
+        assert!(!root.read().await.contains("child"));
+        assert!(!versions.read().await.contains("new"));
+        assert_eq!(
+            dir.read_file::<Data>(TextId(0), &"original".parse()?)
+                .await?
+                .0,
+            [7]
+        );
+    }
+
+    // Rejection created no reservations: later valid work on the same name succeeds.
+    dir.create_file(TextId(5), "new".parse()?, Data(vec![5]))
+        .await?;
+
+    dir.commit(TextId(5)).await?;
+    dir.truncate(TextId(6)).await?;
+    assert!(dir.is_empty(TextId(6)).await?);
+    dir.rollback(TextId(6)).await?;
+    assert_eq!(
+        dir.read_file::<Data>(TextId(7), &"new".parse()?).await?.0,
+        [5]
+    );
+
+    dir.finalize(TextId(5)).await?;
+    Ok(())
+}
+
+thread_local! {
+    static PUBLICATION_OBSERVER: RefCell<Option<Arc<Observation>>> = const { RefCell::new(None) };
+}
+
+pub(crate) async fn published() -> Result<()> {
+    let observer = PUBLICATION_OBSERVER.with(|slot| slot.borrow().clone());
+    if let Some(observer) = observer {
+        observer.enter().await?;
+    }
+
+    Ok(())
+}
+
+struct InstalledPublication;
+
+impl Drop for InstalledPublication {
+    fn drop(&mut self) {
+        PUBLICATION_OBSERVER.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[tokio::test]
+async fn partial_publication_retains_recovery_evidence_and_releases_resources() -> Result<()> {
+    for fail in [false, true] {
+        let path = TestDir::new()?;
+        {
+            let root = Cache::<Data>::new(4096, Some(1), 0, Duration::from_secs(3))
+                .load(path.0.clone())?;
+
+            let dir = Dir::<u64, Data>::load(root.clone()).await?;
+            for name in ["left", "right"] {
+                dir.create_file(1, name.parse()?, Data(vec![1])).await?;
+            }
+
+            dir.commit(1).await?;
+            dir.finalize(1).await?;
+            for name in ["left", "right"] {
+                dir.delete(2, name.parse()?).await?;
+                dir.create_file(2, name.parse()?, Data(vec![2])).await?;
+            }
+
+            // Preserve both stages as recovery evidence before publication starts.
+            root.sync_all().await?;
+            let observer = Observation::new(fail.then_some(0));
+            PUBLICATION_OBSERVER.with(|slot| *slot.borrow_mut() = Some(observer.clone()));
+            let installed = InstalledPublication;
+            let mut commit = Box::pin(dir.commit(2));
+            if fail {
+                let error = commit.await.unwrap_err();
+                let source = std::error::Error::source(&error)
+                    .and_then(|cause| cause.downcast_ref::<io::Error>())
+                    .unwrap();
+
+                assert_eq!(source.kind(), io::ErrorKind::Other);
+                assert_eq!(source.to_string(), "injected lifecycle error");
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    std::future::poll_fn(|cx| {
+                        match std::future::Future::poll(commit.as_mut(), cx) {
+                            std::task::Poll::Pending
+                                if observer.active.load(Ordering::SeqCst) == 1 =>
+                            {
+                                std::task::Poll::Ready(())
+                            }
+                            std::task::Poll::Pending => std::task::Poll::Pending,
+                            std::task::Poll::Ready(result) => {
+                                panic!("expected publication boundary: {result:?}")
+                            }
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+
+                drop(commit);
+            }
+
+            drop(installed);
+            assert_eq!(observer.started.load(Ordering::SeqCst), 1);
+            assert_eq!(observer.active.load(Ordering::SeqCst), 0);
+            assert!(!dir.entries.is_committed(2)?);
+            drop(root.try_write()?);
+            let versions = root.read().await.get_dir(crate::VERSIONS).unwrap().clone();
+            drop(versions.try_write()?);
+            let mut published = 0;
+            for name in ["left", "right"] {
+                let bytes = tokio::fs::read(path.0.join(name)).await?;
+                assert!(bytes == [1] || bytes == [2]);
+                published += usize::from(bytes == [2]);
+                assert_eq!(
+                    tokio::fs::read(path.0.join(crate::VERSIONS).join(name).join("2")).await?,
+                    [2]
+                );
+            }
+
+            assert_eq!(published, 1);
+            // Inspection only: the interrupted owner must not be reused or rolled back.
+        }
+
+        let root =
+            Cache::<Data>::new(4096, Some(1), 0, Duration::from_secs(3)).load(path.0.clone())?;
+
+        assert!(matches!(
+            Dir::<u64, Data>::load(root).await,
+            Err(crate::Error::Corrupt(_))
+        ));
+
+        for name in ["left", "right"] {
+            assert!(path.0.join(crate::VERSIONS).join(name).join("2").exists());
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_guards_outlive_handles_and_stream_setup() -> Result<()> {
+    let path = TestDir::new()?;
+    let root = Cache::<Data>::new(4096, Some(1), 0, Duration::from_secs(3)).load(path.0.clone())?;
+    let dir = Dir::<u64, Data>::load(root).await?;
+    let file = dir.create_file(1, "value".parse()?, Data(vec![4])).await?;
+    let mut files = dir.files::<Data>(1).await?;
+    let (_, value) = files.next().await.unwrap()?;
+    drop(files);
+    assert_eq!(value.0, [4]);
+    assert!(matches!(
+        dir.commit(1).await,
+        Err(crate::Error::Conflict(txn_lock::Error::Busy))
+    ));
+
+    drop(value);
+    dir.commit(1).await?;
+    dir.finalize(1).await?;
+    let value = file.into_read::<Data>(2).await?;
+    drop(dir);
+    assert_eq!(value.0, [4]);
+    Ok(())
+}
+
+#[path = "edge_cases.rs"]
+mod edge_cases;
+
+#[path = "publication_process.rs"]
+mod publication_process;

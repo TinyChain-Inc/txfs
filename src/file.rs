@@ -1,6 +1,5 @@
 use std::fmt;
 use std::hash::Hash;
-use std::io;
 use std::ops::Deref;
 
 use freqfs::{FileLoad, FileReadGuardOwned};
@@ -9,13 +8,13 @@ use safecast::AsType;
 use txn_lock::map::TxnMapValueReadGuard;
 
 use super::dir::Entry;
-use super::{Dir, Error, Result};
+use super::{Dir, Result};
 
 /// A read guard on a version of a transactional [`File`].
 pub struct FileVersionRead<TxnId, FE, F> {
     // Release native access before the directory's transaction permit can notify waiters.
-    version: FileReadGuardOwned<FE, F>,
-    _entry: TxnMapValueReadGuard<Id, Entry<TxnId, FE>>,
+    pub(super) version: FileReadGuardOwned<FE, F>,
+    pub(super) _entry: TxnMapValueReadGuard<Id, Entry<TxnId, FE>>,
 }
 
 impl<TxnId, FE, F> Deref for FileVersionRead<TxnId, FE, F> {
@@ -68,78 +67,7 @@ where
         F: Send + Sync + 'static,
         FE: FileLoad + AsType<F>,
     {
-        let entry = self
-            .directory
-            .entries
-            .get(txn_id, &self.name)
-            .await?
-            .ok_or_else(|| Error::NotFound(self.name.to_string()))?;
-
-        let Entry::File(modified) = &*entry else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("not a file: {}", self.name),
-            )
-            .into());
-        };
-
-        // The directory excludes publication and cleanup until the native read
-        // guard is acquired. The sole history decides both membership and bytes.
-        let versions = self.directory.versions.read().await;
-        let staged = if let Some(modified) = modified {
-            let file_versions = versions.get_dir(self.name.as_str());
-            if let Some(file_versions) = file_versions {
-                file_versions
-                    .read()
-                    .await
-                    .get_file(&modified.to_string())
-                    .cloned()
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let version = if let Some(staged) = staged {
-            staged.into_read().await?
-        } else {
-            let parent = self.directory.canon.read().await;
-            let (baseline, latest) = self.directory.entries.inspect_committed(
-                txn_id,
-                &self.name,
-                |base, latest, _| {
-                    let matches = |entry: Option<&Entry<TxnId, FE>>| matches!(entry, Some(Entry::File(id)) if id == modified);
-
-                    (matches(base), matches(latest))
-                },
-            )?;
-
-            if !baseline {
-                return Err(Error::Corrupt(format!(
-                    "missing retained version for {} at {modified:?}",
-                    self.name
-                )));
-            }
-
-            if !latest {
-                return Err(txn_lock::Error::Outdated.into());
-            }
-
-            let version = parent
-                .get_file(self.name.as_str())
-                .cloned()
-                .ok_or_else(|| {
-                    Error::Corrupt(format!("missing canonical version for {}", self.name))
-                })?;
-
-            version.into_read().await?
-        };
-
-        Ok(FileVersionRead {
-            version,
-            _entry: entry,
-        })
+        self.directory.read_version(txn_id, &self.name).await
     }
 
     /// Lock this file for reading at the given `txn_id` without borrowing.
